@@ -36,9 +36,8 @@ jobs:
           for pattern in "${patterns[@]}"; do
             args+=("-e" "$pattern")
           done
-          if rg -n -F "${args[@]}" \
-            README.md .github Taskfile.yml scripts internal cmd examples services sdk npm docs/design \
-            -g '!**/node_modules/**'; then
+          if git grep -n -F "${args[@]}" -- \
+            README.md .github Taskfile.yml scripts internal cmd examples services sdk npm docs/design; then
               echo "::error::public trace scan found internal development or build traces"
               exit 1
           else
