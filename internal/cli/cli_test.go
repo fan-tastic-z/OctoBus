@@ -269,6 +269,47 @@ func TestServiceImportRecursiveRequestConvertsLocalNPMSourceToAbsolutePath(t *te
 	}
 }
 
+func TestNormalizeImportSourcePreservesServiceRoot(t *testing.T) {
+	tmp := t.TempDir()
+	pkg := filepath.Join(tmp, "pkg")
+	if err := os.Mkdir(pkg, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chdir(wd); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if err := os.Chdir(tmp); err != nil {
+		t.Fatal(err)
+	}
+	gitSource := "https://user:p%40ss@example.com/acme/repo.git//svc@v1.0.0"
+	tests := []struct {
+		name   string
+		source string
+		want   string
+	}{
+		{name: "local service root", source: "./pkg//nested", want: pkg + "//nested"},
+		{name: "npm local service root", source: "npm:./pkg//nested", want: "npm:" + pkg + "//nested"},
+		{name: "https git unchanged", source: gitSource, want: gitSource},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := normalizeImportSource(tc.source)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != tc.want {
+				t.Fatalf("normalizeImportSource(%q)=%q want %q", tc.source, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestServiceImportRequestConvertsLocalSourceToAbsolutePath(t *testing.T) {
 	tmp := t.TempDir()
 	source := filepath.Join(tmp, "service.tgz")

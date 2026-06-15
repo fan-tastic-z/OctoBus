@@ -301,7 +301,7 @@ func (c *CLI) serviceUpdateCommand() *cobra.Command {
 func normalizeImportSource(source string) (string, error) {
 	if strings.HasPrefix(source, "npm:") {
 		spec := strings.TrimPrefix(source, "npm:")
-		normalized, err := normalizeLocalImportSource(spec)
+		normalized, err := normalizeLocalImportPackageSource(spec)
 		if err != nil {
 			return "", err
 		}
@@ -310,7 +310,22 @@ func normalizeImportSource(source string) (string, error) {
 		}
 		return "npm:" + normalized, nil
 	}
-	return normalizeLocalImportSource(source)
+	return normalizeLocalImportPackageSource(source)
+}
+
+func normalizeLocalImportPackageSource(source string) (string, error) {
+	if source == "" || strings.Contains(source, "://") {
+		return source, nil
+	}
+	packageSource, serviceRoot, ok := strings.Cut(source, "//")
+	normalized, err := normalizeLocalImportSource(packageSource)
+	if err != nil {
+		return "", err
+	}
+	if !ok {
+		return normalized, nil
+	}
+	return normalized + "//" + serviceRoot, nil
 }
 
 func normalizeLocalImportSource(source string) (string, error) {

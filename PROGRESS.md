@@ -63,15 +63,15 @@
 
 参考文档：[实施计划阶段 2](docs/plan/recursive-service-import-implementation-plan.md)、[技术方案 Source 规范化要求](docs/spec/recursive-service-import-spec.md)。
 
-- [ ] 2.1 修正 CLI source 规范化
+- [x] 2.1 修正 CLI source 规范化
   - 依赖：1.3。
   - 工作内容：重构 `normalizeImportSource`，非 HTTPS Git source 先拆分 `//service-dir`，只将 package root 转绝对路径，再拼回 suffix；HTTPS Git source 保持原样。
   - 可并行子任务：
-    - [ ] 可并行：补充 `./pkg//nested` 和 `npm:./pkg//nested` 测试。
-    - [ ] 可并行：补充 HTTPS Git source 不被拆分或破坏的测试。
+    - [x] 可并行：补充 `./pkg//nested` 和 `npm:./pkg//nested` 测试。
+    - [x] 可并行：补充 HTTPS Git source 不被拆分或破坏的测试。
   - 测试方案：`go test ./internal/cli`。
   - 验收标准：本地 source 规范化保留 `//service-dir`；旧单 service local/npm source 测试继续通过。
-  - 完成总结：待完成。
+  - 完成总结：已将 `normalizeImportSource` 调整为对非 URL source 先拆分 `//service-dir`，只对 package root 调用本地绝对路径规范化，再拼回 service root；`npm:` source 复用同一逻辑并保留前缀；包含 `://` 的 HTTPS Git source 原样传递给 importer。新增 `TestNormalizeImportSourcePreservesServiceRoot` 覆盖 `./pkg//nested`、`npm:./pkg//nested` 和 HTTPS Git `//svc@ref` 不被拆分。验证命令：`go test ./internal/cli`，结果通过。
 
 - [ ] 2.2 实现 service root 递归发现 helper
   - 依赖：1.2。
