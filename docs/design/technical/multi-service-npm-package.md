@@ -92,9 +92,18 @@ octobus service import hanqing ./platform-services.zip//chaitin__hanqing-ticket
 octobus service import hanqing https://github.com/acme/platform-services.git//chaitin__hanqing-ticket@v1.0.0
 ```
 
+需要一次导入 distribution package 中所有 service root 时，使用 recursive 模式：
+
+```text
+octobus service import --recursive npm:@chaitin-ai/octobus-tentacles
+octobus service import --recursive ./platform-services//chaitin__subset
+```
+
 规则：
 
 - `//service-dir` 选择 distribution artifact 内的 service root。
+- recursive 模式中 `//service-dir` 表示递归发现的 scan root；该 scan root 下发现到的
+  每个 `service.json` 都会按其 `name` 导入为独立 service。
 - 缺省 `//service-dir` 时，distribution package root 本身就是 service root。
 - service dir 必须是相对路径，不允许绝对路径、空路径或 `..`。
 - service dir 不裁剪 artifact，也不改变 dependency install root。
@@ -119,6 +128,28 @@ octobus service import hanqing https://github.com/acme/platform-services.git//ch
 - `node_entry`：根 package 相对路径，例如 `bin/hanqing-ticket.js`。
 - `service_root`：根 package 相对路径，例如 `chaitin__hanqing-ticket`；根 service 使用 `"."`。
 - `package_source`：保留规范化后的 source 字符串，包含 `//service-dir`。
+
+recursive import 对每个 discovered service 写入一条现有 service 记录，不新增 store schema；
+导入前会先校验本次发现到的所有 manifest、service id、bin、schema 和 descriptor，校验失败
+时不提交任何 service。
+
+recursive import 的发现规则是当前契约的一部分：
+
+- scan root 缺省为 package root；`source//some-dir` 只限制递归发现范围。
+- 含 `service.json` 的目录是 service root，发现后不再继续深入该目录。
+- 扫描跳过 `node_modules`、`.git` 和点号开头的隐藏目录。
+- 结果按 package root 相对 service root 稳定排序。
+- scan root 不存在、不是目录、非法或没有发现任何 service 时，导入失败。
+
+每个 recursive 导入项使用自己的 service root 编译 descriptor 和校验 schema，但共享同一次
+source 获取、build/package 准备和 runtime dependency preparation。提交前可发现或可校验
+错误保持零提交；提交阶段的单个 service 文件系统/SQLite 错误只保证该 service 的既有
+rollback 语义，首版不提供跨多个 service 的强事务回滚。
+
+admin import endpoint 在 recursive 模式下返回 `services`、`service_count`、
+`restarted_instances` 和 `restart_errors`。导入成功后，daemon 会按 service id 聚合
+enabled long-running instances 的重启结果；任一重启失败时返回 HTTP 409，并带
+`status: "degraded"`。on-demand service 不执行持久进程重启。
 
 依赖安装只以根 `package.json` 为准。子目录 `package.json` 不参与 import/runtime
 依赖解析。

@@ -17,12 +17,33 @@ import (
 	"testing"
 	"time"
 
+	"github.com/labstack/echo/v5"
+
 	"octobus/internal/domain"
 	"octobus/internal/packageimport"
 	"octobus/internal/protocol"
 	"octobus/internal/store"
 	"octobus/internal/supervisor"
 )
+
+type fakeServiceImporter struct {
+	importFn          func(context.Context, packageimport.Options) (packageimport.Result, error)
+	importRecursiveFn func(context.Context, packageimport.Options) (packageimport.RecursiveResult, error)
+}
+
+func (f fakeServiceImporter) Import(ctx context.Context, opts packageimport.Options) (packageimport.Result, error) {
+	if f.importFn == nil {
+		return packageimport.Result{}, errors.New("unexpected single service import")
+	}
+	return f.importFn(ctx, opts)
+}
+
+func (f fakeServiceImporter) ImportRecursive(ctx context.Context, opts packageimport.Options) (packageimport.RecursiveResult, error) {
+	if f.importRecursiveFn == nil {
+		return packageimport.RecursiveResult{}, errors.New("unexpected recursive service import")
+	}
+	return f.importRecursiveFn(ctx, opts)
+}
 
 func TestStatus(t *testing.T) {
 	ctx := context.Background()
@@ -289,6 +310,157 @@ func TestAdminServiceImportAndRestartLogs(t *testing.T) {
 		if strings.Contains(got, forbidden) {
 			t.Fatalf("service import log leaked %q in:\n%s", forbidden, got)
 		}
+	}
+}
+
+func TestAdminRecursiveServiceImportValidation(t *testing.T) {
+	dataDir := t.TempDir()
+	st, err := store.Open(filepath.Join(dataDir, "octobus.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	srv := &Server{Store: st, Importer: fakeServiceImporter{}, Supervisor: supervisor.New(dataDir, st)}
+	tests := []struct {
+		name string
+		body string
+		want string
+	}{
+		{name: "missing source", body: `{"recursive":true}`, want: "service package source is required"},
+		{name: "service id", body: `{"recursive":true,"service_id":"echo","source":"npm:pkg"}`, want: "service_id cannot be used with recursive import"},
+		{name: "name", body: `{"recursive":true,"name":"Echo","source":"npm:pkg"}`, want: "name cannot be used with recursive import"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			body := serveAdmin(t, srv, http.MethodPost, "/admin/v1/services/import", bytes.NewBufferString(tc.body), http.StatusBadRequest)
+			if !bytes.Contains(body, []byte(tc.want)) {
+				t.Fatalf("body=%s want %q", body, tc.want)
+			}
+		})
+	}
+}
+
+func TestAdminRecursiveServiceImportAggregatesResponse(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	st, err := store.Open(filepath.Join(dataDir, "octobus.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	services := []domain.Service{
+		{ID: "alpha-service", Name: "Alpha", PackageSource: "fixture//alpha", PackageArtifactPath: "pkg-alpha", PackageSHA256: "pkgsha-alpha", DescriptorPath: "desc-alpha", DescriptorSHA256: "descsha-alpha", DescriptorVersion: "descsha-alpha", NodeEntry: "bin/alpha-service.js", RuntimeMode: domain.RuntimeModeLongRunning},
+		{ID: "beta-service", Name: "Beta", PackageSource: "fixture//beta", PackageArtifactPath: "pkg-beta", PackageSHA256: "pkgsha-beta", DescriptorPath: "desc-beta", DescriptorSHA256: "descsha-beta", DescriptorVersion: "descsha-beta", NodeEntry: "bin/beta-service.js", RuntimeMode: domain.RuntimeModeOnDemand},
+	}
+	for _, svc := range services {
+		if err := st.UpsertService(ctx, svc); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := st.UpsertInstance(ctx, domain.Instance{ID: "beta-enabled", ServiceID: "beta-service", Name: "Beta Enabled", Enabled: true, Status: domain.StatusStopped, NodeEntry: "bin/beta-service.js", ConfigJSON: []byte(`{}`)}); err != nil {
+		t.Fatal(err)
+	}
+	source := "npm:@chaitin-ai/octobus-tentacles"
+	srv := &Server{
+		Store:      st,
+		Supervisor: supervisor.New(dataDir, st),
+		Importer: fakeServiceImporter{importRecursiveFn: func(ctx context.Context, opts packageimport.Options) (packageimport.RecursiveResult, error) {
+			if !opts.Recursive || opts.Source != source || opts.ServiceID != "" || opts.Name != "" {
+				t.Fatalf("unexpected recursive options: %+v", opts)
+			}
+			return packageimport.RecursiveResult{Services: services, ServiceCount: len(services)}, nil
+		}},
+	}
+	body := serveAdmin(t, srv, http.MethodPost, "/admin/v1/services/import", bytes.NewBufferString(fmt.Sprintf(`{"recursive":true,"source":%q,"offline":true,"build":"never"}`, source)), http.StatusOK)
+	var got struct {
+		Services           []domain.Service    `json:"services"`
+		ServiceCount       int                 `json:"service_count"`
+		RestartedInstances map[string][]string `json:"restarted_instances"`
+		RestartErrors      map[string][]string `json:"restart_errors"`
+	}
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.ServiceCount != 2 || len(got.Services) != 2 {
+		t.Fatalf("unexpected recursive response: %+v", got)
+	}
+	for _, id := range []string{"alpha-service", "beta-service"} {
+		if got.RestartedInstances[id] == nil || len(got.RestartedInstances[id]) != 0 {
+			t.Fatalf("restarted_instances[%s]=%v", id, got.RestartedInstances[id])
+		}
+		if got.RestartErrors[id] == nil || len(got.RestartErrors[id]) != 0 {
+			t.Fatalf("restart_errors[%s]=%v", id, got.RestartErrors[id])
+		}
+	}
+}
+
+func TestAdminRecursiveServiceImportDegradedOnRestartFailure(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	st, err := store.Open(filepath.Join(dataDir, "octobus.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	service := domain.Service{ID: "alpha-service", Name: "Alpha", PackageSource: "fixture//alpha", PackageArtifactPath: "pkg-alpha", PackageSHA256: "pkgsha-alpha", DescriptorPath: "desc-alpha", DescriptorSHA256: "descsha-alpha", DescriptorVersion: "descsha-alpha", NodeEntry: "bin/alpha-service.js", RuntimeMode: domain.RuntimeModeLongRunning}
+	if err := st.UpsertService(ctx, service); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertInstance(ctx, domain.Instance{ID: "alpha-enabled", ServiceID: "alpha-service", Name: "Alpha Enabled", Enabled: true, Status: domain.StatusStopped, NodeEntry: "bin/alpha-service.js", ConfigJSON: []byte(`{}`)}); err != nil {
+		t.Fatal(err)
+	}
+	srv := &Server{
+		Store:      st,
+		Supervisor: supervisor.New(dataDir, st),
+		Importer: fakeServiceImporter{importRecursiveFn: func(ctx context.Context, opts packageimport.Options) (packageimport.RecursiveResult, error) {
+			return packageimport.RecursiveResult{Services: []domain.Service{service}, ServiceCount: 1}, nil
+		}},
+	}
+	body := serveAdmin(t, srv, http.MethodPost, "/admin/v1/services/import", bytes.NewBufferString(`{"recursive":true,"source":"npm:fixture","offline":true,"build":"never"}`), http.StatusConflict)
+	var got struct {
+		Status             string              `json:"status"`
+		RestartedInstances map[string][]string `json:"restarted_instances"`
+		RestartErrors      map[string][]string `json:"restart_errors"`
+	}
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != "degraded" || len(got.RestartErrors["alpha-service"]) == 0 {
+		t.Fatalf("unexpected degraded response: %+v body=%s", got, body)
+	}
+	if len(got.RestartedInstances["alpha-service"]) != 0 {
+		t.Fatalf("unexpected restarted instances: %+v", got.RestartedInstances)
+	}
+}
+
+func TestAdminRecursiveServiceImportLogsDoNotLeakSourceCredentials(t *testing.T) {
+	var out bytes.Buffer
+	dataDir := t.TempDir()
+	st, err := store.Open(filepath.Join(dataDir, "octobus.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	service := domain.Service{ID: "alpha-service", Name: "Alpha", PackageSource: "https://user:******@example.com/repo.git//alpha", PackageArtifactPath: "pkg-alpha", PackageSHA256: "pkgsha-alpha", DescriptorPath: "desc-alpha", DescriptorSHA256: "descsha-alpha", DescriptorVersion: "descsha-alpha", NodeEntry: "bin/alpha-service.js", RuntimeMode: domain.RuntimeModeOnDemand}
+	srv := &Server{
+		Store: st,
+		Importer: fakeServiceImporter{importRecursiveFn: func(ctx context.Context, opts packageimport.Options) (packageimport.RecursiveResult, error) {
+			return packageimport.RecursiveResult{Services: []domain.Service{service}, ServiceCount: 1}, nil
+		}},
+		Logger: slog.New(slog.NewTextHandler(&out, &slog.HandlerOptions{Level: slog.LevelInfo})),
+	}
+	source := "https://user:p%40ss@example.com/repo.git"
+	body := serveAdmin(t, srv, http.MethodPost, "/admin/v1/services/import", bytes.NewBufferString(fmt.Sprintf(`{"recursive":true,"source":%q,"offline":true}`, source)), http.StatusOK)
+	for _, leaked := range []string{"p%40ss", "p@ss", "https://user:p"} {
+		if bytes.Contains(body, []byte(leaked)) {
+			t.Fatalf("recursive import response leaked %q: %s", leaked, body)
+		}
+		if strings.Contains(out.String(), leaked) {
+			t.Fatalf("recursive import logs leaked %q: %s", leaked, out.String())
+		}
+	}
+	if !bytes.Contains(body, []byte("******")) {
+		t.Fatalf("recursive import response did not include redacted source: %s", body)
 	}
 }
 
@@ -1076,6 +1248,113 @@ func TestAccessLogFollowFailureWritesDaemonLog(t *testing.T) {
 	got := out.String()
 	if !strings.Contains(got, "level=WARN msg=access_log_follow_failed") {
 		t.Fatalf("missing follow failure daemon log:\n%s", got)
+	}
+}
+
+func TestAccessLogHandlerBoundaries(t *testing.T) {
+	srv := &Server{}
+
+	req := httptest.NewRequest(http.MethodPost, "/admin/v1/logs/access", nil)
+	w := httptest.NewRecorder()
+	srv.handleAccessLogs(w, req)
+	if w.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("method status=%d body=%s", w.Code, w.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/admin/v1/logs/access", nil)
+	w = httptest.NewRecorder()
+	srv.handleAccessLogs(w, req)
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("missing path status=%d body=%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "access log path is not configured") {
+		t.Fatalf("missing path body=%s", w.Body.String())
+	}
+}
+
+func TestParseAccessLogQueryBoundaries(t *testing.T) {
+	for _, path := range []string{
+		"/admin/v1/logs/access?limit=",
+		"/admin/v1/logs/access?tail=",
+	} {
+		t.Run(path, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, path, nil)
+			if _, err := parseAccessLogQuery(req); err == nil {
+				t.Fatalf("expected query error for %s", path)
+			}
+		})
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/admin/v1/logs/access?follow=true", nil)
+	filter, err := parseAccessLogQuery(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !filter.Follow || !filter.TailSet || filter.Tail == 0 {
+		t.Fatalf("follow default filter=%+v", filter)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/admin/v1/logs/access?follow=false", nil)
+	filter, err = parseAccessLogQuery(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filter.Follow || filter.TailSet {
+		t.Fatalf("follow=false filter=%+v", filter)
+	}
+}
+
+func TestParseCatalogQueryBoundaries(t *testing.T) {
+	for _, path := range []string{
+		"/admin/v1/catalog/dev?mcp=maybe",
+		"/admin/v1/catalog/dev?connect=maybe",
+		"/admin/v1/catalog/dev?all=maybe",
+	} {
+		t.Run(path, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, path, nil)
+			if _, _, err := parseCatalogQuery(req); err == nil {
+				t.Fatalf("expected query error for %s", path)
+			}
+		})
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/admin/v1/catalog/dev?grpc=false&mcp=false&connect=false", nil)
+	opts, format, err := parseCatalogQuery(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if format != "json" || !opts.IncludeGRPC || opts.IncludeMCP || opts.IncludeConnect {
+		t.Fatalf("default grpc opts=%+v format=%q", opts, format)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/admin/v1/catalog/dev?all=true&format=md", nil)
+	opts, format, err = parseCatalogQuery(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if format != "md" || !opts.IncludeGRPC || !opts.IncludeMCP || !opts.IncludeConnect {
+		t.Fatalf("all opts=%+v format=%q", opts, format)
+	}
+}
+
+func TestFlushResponseWriterFlushesUnderlyingWriter(t *testing.T) {
+	rec := httptest.NewRecorder()
+	flushResponseWriter{ResponseWriter: rec}.Flush()
+	if !rec.Flushed {
+		t.Fatal("underlying response writer was not flushed")
+	}
+}
+
+func TestLoggerAndEchoErrorStatusHelpers(t *testing.T) {
+	var srv *Server
+	if srv.logger() == nil {
+		t.Fatal("nil server logger is nil")
+	}
+	if got := echoErrorStatus(echo.NewHTTPError(http.StatusTeapot, "teapot")); got != http.StatusTeapot {
+		t.Fatalf("echo error status=%d", got)
+	}
+	if got := echoErrorStatus(errors.New("boom")); got != http.StatusInternalServerError {
+		t.Fatalf("plain error status=%d", got)
 	}
 }
 

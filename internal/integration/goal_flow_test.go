@@ -976,12 +976,149 @@ func TestCLIAdminGatewayAndStoreIntegrationCRUD(t *testing.T) {
 	}
 }
 
+func TestCLIRecursiveServiceImportListsServices(t *testing.T) {
+	root := t.TempDir()
+	dataDir := filepath.Join(root, "data")
+	pkgDir := createRecursiveFixturePackage(t, root)
+	st, err := store.Open(filepath.Join(dataDir, "octobus.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	imp := &packageimport.Importer{DataDir: dataDir, Store: st}
+	adminSrv := &admin.Server{Store: st, Importer: imp, Supervisor: supervisor.New(dataDir, st)}
+	httpSrv := httptest.NewServer(adminSrv.Handler())
+	defer httpSrv.Close()
+
+	c := &cli.CLI{AdminAddr: strings.TrimPrefix(httpSrv.URL, "http://"), Client: httpSrv.Client(), Stdout: &bytes.Buffer{}}
+	runCLI := func(args ...string) string {
+		t.Helper()
+		var out bytes.Buffer
+		c.Stdout = &out
+		if err := c.Run(args); err != nil {
+			t.Fatalf("octobus %s: %v\n%s", strings.Join(args, " "), err, out.String())
+		}
+		return out.String()
+	}
+	importOut := runCLI("service", "import", "--recursive", "--offline", "--build", "never", pkgDir)
+	var imported struct {
+		ServiceCount int `json:"service_count"`
+	}
+	if err := json.Unmarshal([]byte(importOut), &imported); err != nil {
+		t.Fatal(err)
+	}
+	if imported.ServiceCount != 2 {
+		t.Fatalf("recursive import service_count=%d output=%s", imported.ServiceCount, importOut)
+	}
+	listOut := runCLI("service", "list")
+	var listed struct {
+		Services []domain.Service `json:"services"`
+	}
+	if err := json.Unmarshal([]byte(listOut), &listed); err != nil {
+		t.Fatal(err)
+	}
+	byID := map[string]domain.Service{}
+	for _, svc := range listed.Services {
+		byID[svc.ID] = svc
+	}
+	for _, want := range []struct {
+		id          string
+		serviceRoot string
+		nodeEntry   string
+	}{
+		{id: "alpha-service", serviceRoot: "vendor__alpha", nodeEntry: "bin/alpha-service.js"},
+		{id: "beta-service", serviceRoot: "nested/vendor__beta", nodeEntry: "bin/beta-service.js"},
+	} {
+		svc, ok := byID[want.id]
+		if !ok {
+			t.Fatalf("service %s missing from service list: %s", want.id, listOut)
+		}
+		if svc.ServiceRoot != want.serviceRoot || svc.NodeEntry != want.nodeEntry {
+			t.Fatalf("service %s metadata mismatch: %+v", want.id, svc)
+		}
+		stored, err := st.GetService(context.Background(), want.id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if stored.ServiceRoot != want.serviceRoot || stored.NodeEntry != want.nodeEntry {
+			t.Fatalf("stored service %s metadata mismatch: %+v", want.id, stored)
+		}
+	}
+}
+
+func TestRecursiveServiceImportRestartDegradedIntegration(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	dataDir := filepath.Join(root, "data")
+	pkgDir := createRecursiveFixturePackage(t, root)
+	st, err := store.Open(filepath.Join(dataDir, "octobus.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	imp := &packageimport.Importer{DataDir: dataDir, Store: st}
+	sup := supervisor.New(dataDir, st)
+	adminSrv := &admin.Server{Store: st, Importer: imp, Supervisor: sup}
+	if _, err := imp.ImportRecursive(ctx, packageimport.Options{Source: pkgDir, Recursive: true, Offline: true, Build: "never"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertInstance(ctx, domain.Instance{ID: "alpha-enabled", ServiceID: "alpha-service", Name: "Alpha Enabled", Enabled: true, Status: domain.StatusStopped, NodeEntry: "bin/alpha-service.js", ConfigJSON: []byte(`{}`)}); err != nil {
+		t.Fatal(err)
+	}
+	resp := postAdminStatus(t, adminSrv, "/admin/v1/services/import", map[string]any{"recursive": true, "source": pkgDir, "offline": true, "build": "never"}, http.StatusConflict)
+	var body struct {
+		Status        string              `json:"status"`
+		RestartErrors map[string][]string `json:"restart_errors"`
+	}
+	if err := json.Unmarshal(resp.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Status != "degraded" || len(body.RestartErrors["alpha-service"]) == 0 {
+		t.Fatalf("unexpected recursive degraded response: %+v body=%s", body, resp.Body.String())
+	}
+	if _, err := st.GetService(ctx, "alpha-service"); err != nil {
+		t.Fatalf("imported service was rolled back after restart failure: %v", err)
+	}
+}
+
 func createFixturePackage(t *testing.T, root string) string {
 	return createFixturePackageWithProto(t, root, "fixture", `syntax = "proto3";
 package echo.v1;
 service EchoService { rpc Echo(EchoMessage) returns (EchoMessage); }
 message EchoMessage { string text = 1; }
 `)
+}
+
+func createRecursiveFixturePackage(t *testing.T, root string) string {
+	t.Helper()
+	pkg := filepath.Join(root, "recursive-fixture")
+	for _, dir := range []string{
+		filepath.Join(pkg, "bin"),
+		filepath.Join(pkg, "vendor__alpha", "proto"),
+		filepath.Join(pkg, "nested", "vendor__beta", "proto"),
+	} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeFile(t, filepath.Join(pkg, "package.json"), `{"name":"recursive-fixture","version":"1.0.0","bin":{"alpha-service":"bin/alpha-service.js","beta-service":"bin/beta-service.js"}}`, 0o644)
+	writeFile(t, filepath.Join(pkg, "bin", "alpha-service.js"), "#!/bin/sh\n", 0o755)
+	writeFile(t, filepath.Join(pkg, "bin", "beta-service.js"), "#!/bin/sh\n", 0o755)
+	writeFile(t, filepath.Join(pkg, "vendor__alpha", "service.json"), `{"schema":"chaitin.octobus.service.v1","name":"alpha-service","displayName":"Alpha Service","proto":{"roots":["proto"],"files":["proto/alpha.proto"]}}`, 0o644)
+	writeFile(t, filepath.Join(pkg, "vendor__alpha", "proto", "alpha.proto"), `syntax = "proto3";
+package alpha.v1;
+service AlphaService { rpc Call(AlphaRequest) returns (AlphaResponse); }
+message AlphaRequest { string text = 1; }
+message AlphaResponse { string text = 1; }
+`, 0o644)
+	writeFile(t, filepath.Join(pkg, "nested", "vendor__beta", "service.json"), `{"schema":"chaitin.octobus.service.v1","name":"beta-service","displayName":"Beta Service","proto":{"roots":["proto"],"files":["proto/beta.proto"]}}`, 0o644)
+	writeFile(t, filepath.Join(pkg, "nested", "vendor__beta", "proto", "beta.proto"), `syntax = "proto3";
+package beta.v1;
+service BetaService { rpc Call(BetaRequest) returns (BetaResponse); }
+message BetaRequest { string text = 1; }
+message BetaResponse { string text = 1; }
+`, 0o644)
+	return pkg
 }
 
 func createFixturePackageWithProto(t *testing.T, root, name, protoBody string) string {

@@ -11,18 +11,27 @@ function readJSON(filePath) {
 export function discoverServices(root) {
   const pkg = readJSON(path.join(root, "package.json"));
   const bin = pkg.bin && typeof pkg.bin === "object" && !Array.isArray(pkg.bin) ? pkg.bin : {};
-  return fs.readdirSync(root, { withFileTypes: true })
-    .filter((dirent) => dirent.isDirectory())
-    .filter((dirent) => fs.existsSync(path.join(root, dirent.name, "service.json")))
-    .map((dirent) => {
-      const manifest = readJSON(path.join(root, dirent.name, "service.json"));
-      return {
-        dir: dirent.name,
+  const services = [];
+  function walk(relDir) {
+    const dir = relDir === "." ? root : path.join(root, relDir);
+    if (fs.existsSync(path.join(dir, "service.json"))) {
+      const manifest = readJSON(path.join(dir, "service.json"));
+      services.push({
+        dir: relDir,
         id: manifest.name,
         nodeEntry: bin[manifest.name],
-      };
-    })
-    .sort((a, b) => a.dir.localeCompare(b.dir));
+      });
+      return;
+    }
+    for (const dirent of fs.readdirSync(dir, { withFileTypes: true })) {
+      if (!dirent.isDirectory() || dirent.name === "node_modules" || dirent.name === ".git" || dirent.name.startsWith(".")) {
+        continue;
+      }
+      walk(relDir === "." ? dirent.name : path.join(relDir, dirent.name));
+    }
+  }
+  walk(".");
+  return services.sort((a, b) => a.dir.localeCompare(b.dir));
 }
 
 function parseArgs(argv) {
@@ -96,20 +105,21 @@ export function main(argv = process.argv.slice(2), root = process.cwd()) {
 
   try {
     waitForDaemon(opts.octobus, addr, logPath);
+    console.log(`import recursive ${serviceRoot}`);
+    run(opts.octobus, ["--addr", addr, "service", "import", "--recursive", serviceRoot], { cwd: serviceRoot });
+    const listOutput = run(opts.octobus, ["--addr", addr, "service", "list"], { cwd: serviceRoot });
+    const listed = JSON.parse(listOutput).services ?? [];
+    const listedByID = new Map(listed.map((service) => [service.ID, service]));
     for (const service of services) {
-      console.log(`import ${service.dir}`);
-      const source = `${serviceRoot}//${service.dir}`;
-      const output = run(opts.octobus, ["--addr", addr, "service", "import", "--id", service.id, source], { cwd: serviceRoot });
-      const parsed = JSON.parse(output);
-      const imported = parsed.service ?? {};
+      const imported = listedByID.get(service.id) ?? {};
       if (imported.ID !== service.id) {
-        throw new Error(`${service.dir}: imported ID ${imported.ID} did not match ${service.id}`);
+        throw new Error(`${service.dir}: listed ID ${imported.ID} did not match ${service.id}`);
       }
       if (imported.ServiceRoot !== service.dir) {
-        throw new Error(`${service.dir}: imported ServiceRoot ${imported.ServiceRoot} did not match ${service.dir}`);
+        throw new Error(`${service.dir}: listed ServiceRoot ${imported.ServiceRoot} did not match ${service.dir}`);
       }
       if (imported.NodeEntry !== service.nodeEntry) {
-        throw new Error(`${service.dir}: imported NodeEntry ${imported.NodeEntry} did not match ${service.nodeEntry}`);
+        throw new Error(`${service.dir}: listed NodeEntry ${imported.NodeEntry} did not match ${service.nodeEntry}`);
       }
     }
     console.log(`import checks passed for ${services.length} services`);

@@ -463,4 +463,7 @@ test("import check discovers services and validates CLI arguments", () => {
   }]);
   assert.throws(() => importCheckMain(["--unknown"], root), /unknown argument/);
   assert.throws(() => importCheckMain(["--octobus", ""], root), /--octobus must not be empty/);
+  const script = fs.readFileSync(new URL("../scripts/import-check-all.mjs", import.meta.url), "utf8");
+  assert.match(script, /"service", "import", "--recursive"/);
+  assert.doesNotMatch(script, /"service", "import", "--id"/);
 });

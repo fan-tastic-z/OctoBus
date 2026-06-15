@@ -10,9 +10,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"octobus/internal/descriptors"
@@ -32,11 +34,20 @@ type Options struct {
 	Offline   bool   `json:"offline"`
 	Reinstall bool   `json:"reinstall"`
 	Build     string `json:"build"`
+	Recursive bool   `json:"recursive"`
 }
 
 type Result struct {
 	Service  domain.Service
 	Manifest domain.ServiceManifest
+}
+
+type RecursiveResult struct {
+	Services           []domain.Service
+	ServiceCount       int
+	Manifests          map[string]domain.ServiceManifest
+	RestartedInstances map[string][]string
+	RestartErrors      map[string][]string
 }
 
 type preparedSource struct {
@@ -48,6 +59,26 @@ type preparedSource struct {
 	ServiceRoot           string
 	BuildAllowed          bool
 	RuntimeNodeModulesDir string
+}
+
+type preparedService struct {
+	ServiceRoot    string
+	ServiceRootDir string
+	Manifest       domain.ServiceManifest
+	NodeEntry      string
+	RuntimeMode    domain.RuntimeMode
+}
+
+type compiledServiceDescriptor struct {
+	Path   string
+	Result descriptors.CompileResult
+}
+
+type recursiveServiceCandidate struct {
+	ServiceID  string
+	Prepared   preparedSource
+	Service    preparedService
+	Descriptor compiledServiceDescriptor
 }
 
 type BuildPolicy string
@@ -89,91 +120,142 @@ func (i *Importer) Import(ctx context.Context, opts Options) (Result, error) {
 	if prepared, err = buildSourcePackage(ctx, prepared, staging, policy, opts.Offline); err != nil {
 		return Result{}, err
 	}
+	service, err := validatePreparedService(prepared)
+	if err != nil {
+		return Result{}, err
+	}
+	runtimeDir, err := prepareServiceRuntime(ctx, prepared, staging, opts)
+	if err != nil {
+		return Result{}, err
+	}
+	descriptor, err := compileServiceDescriptor(staging, service)
+	if err != nil {
+		return Result{}, err
+	}
+	commitDir, finalPackageDir, err := stageServiceCommit(prepared, runtimeDir, descriptor, staging)
+	if err != nil {
+		return Result{}, err
+	}
+	svc, err := i.buildImportedService(ctx, opts, prepared, service, descriptor.Result, serviceDir, finalPackageDir)
+	if err != nil {
+		return Result{}, err
+	}
+	stored, err := i.commitImportedService(ctx, svc, serviceDir, commitDir)
+	if err != nil {
+		return Result{}, err
+	}
+	return Result{Service: stored, Manifest: service.Manifest}, nil
+}
+
+func validatePreparedService(prepared preparedSource) (preparedService, error) {
 	serviceRootDir := filepath.Join(prepared.PackageDir, filepath.FromSlash(prepared.ServiceRoot))
 	manifest, err := readManifest(serviceRootDir)
 	if err != nil {
-		return Result{}, err
+		return preparedService{}, err
 	}
 	entry, err := inferPackageBinForService(prepared.PackageDir, manifest.Name)
 	if err != nil {
-		return Result{}, err
-	}
-	if err := validatePackageFile(prepared.PackageDir, entry, "package.json bin"); err != nil {
-		return Result{}, err
+		return preparedService{}, err
 	}
 	runtimeMode, err := domain.ManifestRuntimeMode(manifest)
 	if err != nil {
-		return Result{}, err
+		return preparedService{}, err
 	}
+	return preparedService{
+		ServiceRoot:    prepared.ServiceRoot,
+		ServiceRootDir: serviceRootDir,
+		Manifest:       manifest,
+		NodeEntry:      entry,
+		RuntimeMode:    runtimeMode,
+	}, nil
+}
+
+func prepareServiceRuntime(ctx context.Context, prepared preparedSource, staging string, opts Options) (string, error) {
 	runtimeDir := filepath.Join(staging, "runtime")
 	if err := copyDir(prepared.PackageDir, runtimeDir); err != nil {
-		return Result{}, err
+		return "", err
 	}
 	if prepared.RuntimeNodeModulesDir != "" {
 		if err := copyDir(prepared.RuntimeNodeModulesDir, filepath.Join(runtimeDir, "node_modules")); err != nil {
-			return Result{}, err
+			return "", err
 		}
 	}
 	if err := replaceLocalExampleSDK(runtimeDir); err != nil {
-		return Result{}, err
+		return "", err
 	}
 	if err := prepareRuntime(ctx, runtimeDir, opts.Offline, opts.Reinstall); err != nil {
-		return Result{}, err
+		return "", err
 	}
 	if err := replaceLocalExampleSDK(runtimeDir); err != nil {
-		return Result{}, err
+		return "", err
 	}
+	return runtimeDir, nil
+}
+
+func compileServiceDescriptor(staging string, service preparedService) (compiledServiceDescriptor, error) {
 	descriptorPath := filepath.Join(staging, "descriptor.protoset")
+	return compileServiceDescriptorAt(descriptorPath, service)
+}
+
+func compileServiceDescriptorAt(descriptorPath string, service preparedService) (compiledServiceDescriptor, error) {
 	compiled, err := descriptors.Compile(descriptors.CompileRequest{
-		PackageDir:     serviceRootDir,
-		ProtoRoots:     manifest.Proto.Roots,
-		ProtoFiles:     manifest.Proto.Files,
+		PackageDir:     service.ServiceRootDir,
+		ProtoRoots:     service.Manifest.Proto.Roots,
+		ProtoFiles:     service.Manifest.Proto.Files,
 		DescriptorPath: descriptorPath,
 	})
 	if err != nil {
-		return Result{}, err
+		return compiledServiceDescriptor{}, err
 	}
+	return compiledServiceDescriptor{Path: descriptorPath, Result: compiled}, nil
+}
+
+func stageServiceCommit(prepared preparedSource, runtimeDir string, descriptor compiledServiceDescriptor, staging string) (string, string, error) {
 	commitDir := filepath.Join(staging, "service")
 	finalPackageDir := filepath.Join(commitDir, "package")
 	finalRuntimeDir := filepath.Join(commitDir, "runtime")
 	finalDescriptor := filepath.Join(commitDir, "descriptor.protoset")
 	finalArtifact := filepath.Join(commitDir, filepath.Base(prepared.ArtifactPath))
 	if err := os.RemoveAll(commitDir); err != nil {
-		return Result{}, err
+		return "", "", err
 	}
 	if err := os.MkdirAll(commitDir, 0o755); err != nil {
-		return Result{}, err
+		return "", "", err
 	}
 	if err := copyFile(prepared.ArtifactPath, finalArtifact, 0o644); err != nil {
-		return Result{}, err
+		return "", "", err
 	}
 	if err := copyDir(prepared.PackageDir, finalPackageDir); err != nil {
-		return Result{}, err
+		return "", "", err
 	}
 	if err := copyDir(runtimeDir, finalRuntimeDir); err != nil {
-		return Result{}, err
+		return "", "", err
 	}
-	if err := copyFile(descriptorPath, finalDescriptor, 0o644); err != nil {
-		return Result{}, err
+	if err := copyFile(descriptor.Path, finalDescriptor, 0o644); err != nil {
+		return "", "", err
 	}
+	return commitDir, finalPackageDir, nil
+}
 
-	serviceName, err := i.importServiceName(ctx, opts, manifest)
+func (i *Importer) buildImportedService(ctx context.Context, opts Options, prepared preparedSource, service preparedService, compiled descriptors.CompileResult, serviceDir, finalPackageDir string) (domain.Service, error) {
+	serviceName, err := i.importServiceName(ctx, opts, service.Manifest)
 	if err != nil {
-		return Result{}, err
+		return domain.Service{}, err
 	}
 	configSchemaPath := ""
-	if manifest.ConfigSchema != "" {
-		if err := validatePackageFile(filepath.Join(finalPackageDir, filepath.FromSlash(prepared.ServiceRoot)), manifest.ConfigSchema, "configSchema"); err != nil {
-			return Result{}, err
+	serviceRootPath := filepath.FromSlash(service.ServiceRoot)
+	if service.Manifest.ConfigSchema != "" {
+		if err := validatePackageFile(filepath.Join(finalPackageDir, serviceRootPath), service.Manifest.ConfigSchema, "configSchema"); err != nil {
+			return domain.Service{}, err
 		}
-		configSchemaPath = filepath.Join(serviceDir, "package", filepath.FromSlash(prepared.ServiceRoot), manifest.ConfigSchema)
+		configSchemaPath = filepath.Join(serviceDir, "package", serviceRootPath, service.Manifest.ConfigSchema)
 	}
 	secretSchemaPath := ""
-	if manifest.SecretSchema != "" {
-		if err := validatePackageFile(filepath.Join(finalPackageDir, filepath.FromSlash(prepared.ServiceRoot)), manifest.SecretSchema, "secretSchema"); err != nil {
-			return Result{}, err
+	if service.Manifest.SecretSchema != "" {
+		if err := validatePackageFile(filepath.Join(finalPackageDir, serviceRootPath), service.Manifest.SecretSchema, "secretSchema"); err != nil {
+			return domain.Service{}, err
 		}
-		secretSchemaPath = filepath.Join(serviceDir, "package", filepath.FromSlash(prepared.ServiceRoot), manifest.SecretSchema)
+		secretSchemaPath = filepath.Join(serviceDir, "package", serviceRootPath, service.Manifest.SecretSchema)
 	}
 	finalStoredArtifact := filepath.Join(serviceDir, filepath.Base(prepared.ArtifactPath))
 	finalStoredDescriptor := filepath.Join(serviceDir, "descriptor.protoset")
@@ -188,28 +270,158 @@ func (i *Importer) Import(ctx context.Context, opts Options) (Result, error) {
 		DescriptorSHA256:    compiled.DescriptorSHA256,
 		DescriptorVersion:   compiled.DescriptorVersion,
 		Methods:             compiled.Methods,
-		NodeEntry:           entry,
-		ServiceRoot:         prepared.ServiceRoot,
-		RuntimeMode:         runtimeMode,
+		NodeEntry:           service.NodeEntry,
+		ServiceRoot:         service.ServiceRoot,
+		RuntimeMode:         service.RuntimeMode,
 		ConfigSchemaPath:    configSchemaPath,
 		SecretSchemaPath:    secretSchemaPath,
 	}
+	return svc, nil
+}
+
+func (i *Importer) commitImportedService(ctx context.Context, svc domain.Service, serviceDir, commitDir string) (domain.Service, error) {
 	rollback, cleanup, err := replaceServiceDir(serviceDir, commitDir)
 	if err != nil {
-		return Result{}, err
+		return domain.Service{}, err
 	}
 	if err := i.Store.UpsertService(ctx, svc); err != nil {
 		_ = rollback()
-		return Result{}, err
+		return domain.Service{}, err
 	}
 	if err := cleanup(); err != nil {
-		return Result{}, err
+		return domain.Service{}, err
 	}
-	stored, err := i.Store.GetService(ctx, opts.ServiceID)
+	stored, err := i.Store.GetService(ctx, svc.ID)
 	if err != nil {
-		return Result{}, err
+		return domain.Service{}, err
 	}
-	return Result{Service: stored, Manifest: manifest}, nil
+	return stored, nil
+}
+
+func (i *Importer) ImportRecursive(ctx context.Context, opts Options) (RecursiveResult, error) {
+	if i.Store == nil {
+		return RecursiveResult{}, errors.New("store is required")
+	}
+	if opts.Source == "" {
+		return RecursiveResult{}, errors.New("service package source is required")
+	}
+	if opts.ServiceID != "" {
+		return RecursiveResult{}, errors.New("service_id cannot be used with recursive import")
+	}
+	if opts.Name != "" {
+		return RecursiveResult{}, errors.New("name cannot be used with recursive import")
+	}
+	baseSource, _, err := splitSourceServiceRoot(opts.Source)
+	if err != nil {
+		return RecursiveResult{}, err
+	}
+	staging := filepath.Join(i.DataDir, "artifacts", "services", ".staging-recursive-import")
+	if err := os.RemoveAll(staging); err != nil {
+		return RecursiveResult{}, err
+	}
+	if err := os.MkdirAll(staging, 0o755); err != nil {
+		return RecursiveResult{}, err
+	}
+	defer os.RemoveAll(staging)
+
+	prepared, err := i.prepareSource(ctx, opts, staging)
+	if err != nil {
+		return RecursiveResult{}, err
+	}
+	policy, err := parseBuildPolicy(opts.Build)
+	if err != nil {
+		return RecursiveResult{}, err
+	}
+	if prepared, err = buildSourcePackage(ctx, prepared, staging, policy, opts.Offline); err != nil {
+		return RecursiveResult{}, err
+	}
+	basePackageSource := recursiveBasePackageSource(opts.Source, baseSource)
+	runtimeDir, err := prepareServiceRuntime(ctx, prepared, staging, opts)
+	if err != nil {
+		return RecursiveResult{}, err
+	}
+	serviceRoots, err := discoverServiceRoots(prepared.PackageDir, prepared.ServiceRoot)
+	if err != nil {
+		return RecursiveResult{}, err
+	}
+	candidates := make([]recursiveServiceCandidate, 0, len(serviceRoots))
+	manifests := make(map[string]domain.ServiceManifest, len(serviceRoots))
+	seen := make(map[string]string, len(serviceRoots))
+	descriptorDir := filepath.Join(staging, "descriptors")
+	for idx, serviceRoot := range serviceRoots {
+		servicePrepared := prepared
+		servicePrepared.ServiceRoot = serviceRoot
+		servicePrepared.PackageSource = sourceWithServiceRootForPackage(basePackageSource, serviceRoot)
+		service, err := validatePreparedService(servicePrepared)
+		if err != nil {
+			return RecursiveResult{}, fmt.Errorf("validate service %s: %w", serviceRoot, err)
+		}
+		serviceID := service.Manifest.Name
+		if err := domain.ValidateID("service", serviceID); err != nil {
+			return RecursiveResult{}, fmt.Errorf("validate service %s id %q: %w", serviceRoot, serviceID, err)
+		}
+		if previousRoot := seen[serviceID]; previousRoot != "" {
+			return RecursiveResult{}, fmt.Errorf("duplicate service id %q in %s and %s", serviceID, previousRoot, serviceRoot)
+		}
+		seen[serviceID] = serviceRoot
+		if err := validateServiceSchemas(prepared.PackageDir, service); err != nil {
+			return RecursiveResult{}, fmt.Errorf("validate service %s schemas: %w", serviceRoot, err)
+		}
+		descriptorPath := filepath.Join(descriptorDir, fmt.Sprintf("%03d-%s.protoset", idx, serviceID))
+		descriptor, err := compileServiceDescriptorAt(descriptorPath, service)
+		if err != nil {
+			return RecursiveResult{}, fmt.Errorf("compile service %s descriptor: %w", serviceRoot, err)
+		}
+		candidates = append(candidates, recursiveServiceCandidate{
+			ServiceID:  serviceID,
+			Prepared:   servicePrepared,
+			Service:    service,
+			Descriptor: descriptor,
+		})
+		manifests[serviceID] = service.Manifest
+	}
+
+	result := RecursiveResult{
+		Services:           make([]domain.Service, 0, len(candidates)),
+		ServiceCount:       len(candidates),
+		Manifests:          manifests,
+		RestartedInstances: map[string][]string{},
+		RestartErrors:      map[string][]string{},
+	}
+	for _, candidate := range candidates {
+		serviceDir := filepath.Join(i.DataDir, "artifacts", "services", candidate.ServiceID)
+		commitDir, finalPackageDir, err := stageServiceCommit(candidate.Prepared, runtimeDir, candidate.Descriptor, staging)
+		if err != nil {
+			return result, fmt.Errorf("stage service %s: %w", candidate.ServiceID, err)
+		}
+		serviceOpts := opts
+		serviceOpts.ServiceID = candidate.ServiceID
+		svc, err := i.buildImportedService(ctx, serviceOpts, candidate.Prepared, candidate.Service, candidate.Descriptor.Result, serviceDir, finalPackageDir)
+		if err != nil {
+			return result, fmt.Errorf("build service %s: %w", candidate.ServiceID, err)
+		}
+		stored, err := i.commitImportedService(ctx, svc, serviceDir, commitDir)
+		if err != nil {
+			return result, fmt.Errorf("commit service %s: %w", candidate.ServiceID, err)
+		}
+		result.Services = append(result.Services, stored)
+	}
+	return result, nil
+}
+
+func validateServiceSchemas(packageDir string, service preparedService) error {
+	serviceRootDir := filepath.Join(packageDir, filepath.FromSlash(service.ServiceRoot))
+	if service.Manifest.ConfigSchema != "" {
+		if err := validatePackageFile(serviceRootDir, service.Manifest.ConfigSchema, "configSchema"); err != nil {
+			return err
+		}
+	}
+	if service.Manifest.SecretSchema != "" {
+		if err := validatePackageFile(serviceRootDir, service.Manifest.SecretSchema, "secretSchema"); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func replaceLocalExampleSDK(runtimeDir string) error {
@@ -400,6 +612,101 @@ func sourceWithServiceRoot(source, serviceRoot string) string {
 		return source
 	}
 	return source + "//" + serviceRoot
+}
+
+func recursiveBasePackageSource(rawSource, fallbackBase string) string {
+	if classifySource(rawSource) != sourceHTTPSGit {
+		return fallbackBase
+	}
+	src, err := parseGitSource(rawSource)
+	if err != nil {
+		return fallbackBase
+	}
+	redacted := src.Redacted
+	if src.Subdir == "" {
+		return redacted
+	}
+	ref, withoutRef := splitGitRef(redacted)
+	withoutRef = strings.TrimSuffix(withoutRef, "//"+src.Subdir)
+	if ref == "" {
+		return withoutRef
+	}
+	return withoutRef + "@" + ref
+}
+
+func sourceWithServiceRootForPackage(source, serviceRoot string) string {
+	if serviceRoot == "" || serviceRoot == "." {
+		return source
+	}
+	if classifySource(source) == sourceHTTPSGit {
+		ref, withoutRef := splitGitRef(source)
+		withRoot := withoutRef + "//" + serviceRoot
+		if ref == "" {
+			return withRoot
+		}
+		return withRoot + "@" + ref
+	}
+	return sourceWithServiceRoot(source, serviceRoot)
+}
+
+func discoverServiceRoots(packageDir, scanRoot string) ([]string, error) {
+	if scanRoot == "" {
+		scanRoot = "."
+	}
+	cleanRoot := "."
+	if scanRoot != "." {
+		var err error
+		cleanRoot, err = cleanServiceRoot(scanRoot)
+		if err != nil {
+			return nil, err
+		}
+	}
+	scanDir := packageDir
+	if cleanRoot != "." {
+		scanDir = filepath.Join(packageDir, filepath.FromSlash(cleanRoot))
+	}
+	info, err := os.Stat(scanDir)
+	if err != nil {
+		return nil, fmt.Errorf("scan root %q: %w", cleanRoot, err)
+	}
+	if !info.IsDir() {
+		return nil, fmt.Errorf("scan root %q is not a directory", cleanRoot)
+	}
+	var roots []string
+	if err := filepath.WalkDir(scanDir, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if !entry.IsDir() {
+			return nil
+		}
+		if path != scanDir && skipDiscoveryDir(entry.Name()) {
+			return filepath.SkipDir
+		}
+		if _, err := os.Stat(filepath.Join(path, "service.json")); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return nil
+			}
+			return err
+		}
+		rel, err := filepath.Rel(packageDir, path)
+		if err != nil {
+			return err
+		}
+		roots = append(roots, filepath.ToSlash(rel))
+		return filepath.SkipDir
+	}); err != nil {
+		return nil, fmt.Errorf("discover service roots under %q: %w", cleanRoot, err)
+	}
+	sort.Strings(roots)
+	if len(roots) == 0 {
+		return nil, fmt.Errorf("no service roots found under %q", cleanRoot)
+	}
+	return roots, nil
+}
+
+func skipDiscoveryDir(name string) bool {
+	return name == "node_modules" || name == ".git" || strings.HasPrefix(name, ".")
 }
 
 func (i *Importer) packNPM(ctx context.Context, spec, staging string) (preparedSource, error) {

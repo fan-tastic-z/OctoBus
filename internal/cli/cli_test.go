@@ -205,6 +205,111 @@ func TestServiceImportRequest(t *testing.T) {
 	}
 }
 
+func TestServiceImportRecursiveRequest(t *testing.T) {
+	source := "npm:@chaitin-ai/octobus-tentacles"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/admin/v1/services/import" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		var req map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatal(err)
+		}
+		if req["recursive"] != true || req["source"] != source || req["build"] != "auto" {
+			t.Fatalf("unexpected recursive body: %+v", req)
+		}
+		if _, ok := req["service_id"]; ok {
+			t.Fatalf("recursive request should not include service_id: %+v", req)
+		}
+		if _, ok := req["name"]; ok {
+			t.Fatalf("recursive request should not include name: %+v", req)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"services": []any{}, "service_count": 0})
+	}))
+	defer server.Close()
+	c := &CLI{AdminAddr: strings.TrimPrefix(server.URL, "http://"), Client: server.Client(), Stdout: io.Discard}
+	if err := c.Run([]string{"service", "import", "--recursive", source}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestServiceImportRecursiveRequestConvertsLocalNPMSourceToAbsolutePath(t *testing.T) {
+	tmp := t.TempDir()
+	pkg := filepath.Join(tmp, "pkg")
+	if err := os.Mkdir(pkg, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chdir(wd); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if err := os.Chdir(tmp); err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatal(err)
+		}
+		want := "npm:" + pkg
+		if req["recursive"] != true || req["source"] != want {
+			t.Fatalf("unexpected recursive body: %+v want source %q", req, want)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"services": []any{}, "service_count": 0})
+	}))
+	defer server.Close()
+	c := &CLI{AdminAddr: strings.TrimPrefix(server.URL, "http://"), Client: server.Client(), Stdout: io.Discard}
+	if err := c.Run([]string{"service", "import", "--recursive", "npm:./pkg"}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestNormalizeImportSourcePreservesServiceRoot(t *testing.T) {
+	tmp := t.TempDir()
+	pkg := filepath.Join(tmp, "pkg")
+	if err := os.Mkdir(pkg, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chdir(wd); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if err := os.Chdir(tmp); err != nil {
+		t.Fatal(err)
+	}
+	gitSource := "https://user:p%40ss@example.com/acme/repo.git//svc@v1.0.0"
+	tests := []struct {
+		name   string
+		source string
+		want   string
+	}{
+		{name: "local service root", source: "./pkg//nested", want: pkg + "//nested"},
+		{name: "npm local service root", source: "npm:./pkg//nested", want: "npm:" + pkg + "//nested"},
+		{name: "https git unchanged", source: gitSource, want: gitSource},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := normalizeImportSource(tc.source)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != tc.want {
+				t.Fatalf("normalizeImportSource(%q)=%q want %q", tc.source, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestServiceImportRequestConvertsLocalSourceToAbsolutePath(t *testing.T) {
 	tmp := t.TempDir()
 	source := filepath.Join(tmp, "service.tgz")
@@ -884,6 +989,9 @@ func TestCommandValidationErrors(t *testing.T) {
 		{name: "service usage", args: []string{"service"}, want: "usage: octobus service"},
 		{name: "service import id", args: []string{"service", "import"}, want: "service id is required"},
 		{name: "service import source", args: []string{"service", "import", "pkg"}, want: "service source is required"},
+		{name: "service import recursive source", args: []string{"service", "import", "--recursive"}, want: "service source is required"},
+		{name: "service import recursive extra arg", args: []string{"service", "import", "--recursive", "pkg", "extra"}, want: "accepts 1 arg(s), received 2"},
+		{name: "service import recursive name", args: []string{"service", "import", "--recursive", "--name", "Name", "pkg"}, want: "--name cannot be used with --recursive"},
 		{name: "service update id", args: []string{"service", "update"}, want: "service id is required"},
 		{name: "service update name", args: []string{"service", "update", "echo"}, want: "service name is required"},
 		{name: "service get", args: []string{"service", "get"}, want: "service id is required"},
@@ -997,6 +1105,9 @@ func TestCLIHelpUsesFinalCommandShape(t *testing.T) {
 				if strings.Contains(help, forbidden) {
 					t.Fatalf("help for %v contains %q:\n%s", args, forbidden, help)
 				}
+			}
+			if strings.Join(args, " ") == "service import --help" && strings.Contains(help, "--all") {
+				t.Fatalf("service import help contains --all alias:\n%s", help)
 			}
 		})
 	}

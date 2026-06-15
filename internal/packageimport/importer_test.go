@@ -31,6 +31,9 @@ func TestImporterImportsDirectoryPackage(t *testing.T) {
 	if res.Service.RuntimeMode != domain.RuntimeModeLongRunning {
 		t.Fatalf("runtime mode=%q", res.Service.RuntimeMode)
 	}
+	if res.Manifest.Name != "echo-wrapper" || res.Service.ServiceRoot != "." {
+		t.Fatalf("single service metadata regressed: result=%+v manifest=%+v", res.Service, res.Manifest)
+	}
 	if res.Service.NodeEntry != filepath.Clean("bin/echo.js") {
 		t.Fatalf("node entry=%q", res.Service.NodeEntry)
 	}
@@ -86,6 +89,208 @@ message ListResponse { string text = 1; }
 	}
 	if len(res.Service.Methods) != 1 || res.Service.Methods[0].FullName != "hanqing.ticket.v1.TicketService/List" {
 		t.Fatalf("descriptor was not compiled from service root: %+v", res.Service.Methods)
+	}
+}
+
+func TestImporterImportRecursiveImportsMultiServicePackage(t *testing.T) {
+	dataDir, s := openTestStore(t)
+	pkg := writeMultiServiceTestPackage(t, t.TempDir())
+	res, err := (&Importer{DataDir: dataDir, Store: s}).ImportRecursive(context.Background(), Options{Source: pkg.Root, Recursive: true, Offline: true, Build: "never"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.ServiceCount != len(pkg.Services) || len(res.Services) != len(pkg.Services) || len(res.Manifests) != len(pkg.Services) {
+		t.Fatalf("unexpected recursive result: %+v", res)
+	}
+	gotByID := map[string]domain.Service{}
+	for _, svc := range res.Services {
+		gotByID[svc.ID] = svc
+	}
+	for _, want := range pkg.Services {
+		svc, ok := gotByID[want.ID]
+		if !ok {
+			t.Fatalf("service %s missing from result: %+v", want.ID, res.Services)
+		}
+		if svc.Name != want.ID+" display" || svc.PackageSource != sourceWithServiceRoot(pkg.Root, want.ServiceRoot) || svc.ServiceRoot != want.ServiceRoot || svc.NodeEntry != filepath.Clean(want.NodeEntry) {
+			t.Fatalf("service %s metadata mismatch: %+v", want.ID, svc)
+		}
+		if len(svc.Methods) != 1 || svc.Methods[0].FullName != want.MethodFull {
+			t.Fatalf("service %s methods mismatch: %+v", want.ID, svc.Methods)
+		}
+		for _, path := range []string{svc.PackageArtifactPath, svc.DescriptorPath, svc.ConfigSchemaPath, svc.SecretSchemaPath} {
+			if _, err := os.Stat(path); err != nil {
+				t.Fatalf("service %s expected artifact %s: %v", want.ID, path, err)
+			}
+		}
+		stored, err := s.GetService(context.Background(), want.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if stored.PackageSource != svc.PackageSource || stored.ServiceRoot != svc.ServiceRoot {
+			t.Fatalf("stored service %s mismatch: %+v", want.ID, stored)
+		}
+	}
+}
+
+func TestImporterImportRecursiveHonorsScanRoot(t *testing.T) {
+	dataDir, s := openTestStore(t)
+	pkg := writeMultiServiceTestPackage(t, t.TempDir())
+	res, err := (&Importer{DataDir: dataDir, Store: s}).ImportRecursive(context.Background(), Options{Source: pkg.Root + "//nested", Recursive: true, Offline: true, Build: "never"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.ServiceCount != 1 || len(res.Services) != 1 || res.Services[0].ID != "gamma-service" || res.Services[0].ServiceRoot != "nested/vendor__gamma" {
+		t.Fatalf("unexpected scan-root recursive result: %+v", res)
+	}
+	if _, err := s.GetService(context.Background(), "alpha-service"); err == nil {
+		t.Fatal("service outside scan root was imported")
+	}
+}
+
+func TestImporterImportRecursiveImportsRootService(t *testing.T) {
+	dataDir, s := openTestStore(t)
+	pkg := writeTestPackage(t, t.TempDir(), `{"schema":"chaitin.octobus.service.v1","name":"echo-wrapper","displayName":"Echo Wrapper","proto":{"roots":["proto"],"files":["proto/echo.proto"]}}`)
+	res, err := (&Importer{DataDir: dataDir, Store: s}).ImportRecursive(context.Background(), Options{Source: pkg, Recursive: true, Offline: true, Build: "never"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.ServiceCount != 1 || len(res.Services) != 1 {
+		t.Fatalf("unexpected root recursive result: %+v", res)
+	}
+	svc := res.Services[0]
+	if svc.ID != "echo-wrapper" || svc.Name != "Echo Wrapper" || svc.ServiceRoot != "." || svc.PackageSource != pkg {
+		t.Fatalf("root service metadata mismatch: %+v", svc)
+	}
+}
+
+func TestImporterImportRecursivePrevalidationFailuresKeepStoreEmpty(t *testing.T) {
+	tests := []struct {
+		name  string
+		setup func(t *testing.T, pkg multiServiceTestPackage) string
+		want  string
+	}{
+		{
+			name: "duplicate id",
+			setup: func(t *testing.T, pkg multiServiceTestPackage) string {
+				updateMultiServiceManifestName(t, pkg.Root, "vendor__beta", "alpha-service")
+				return pkg.Root
+			},
+			want: "duplicate service id",
+		},
+		{
+			name: "invalid id",
+			setup: func(t *testing.T, pkg multiServiceTestPackage) string {
+				updateMultiServiceManifestName(t, pkg.Root, "vendor__alpha", "bad/id")
+				updatePackageBin(t, pkg.Root, func(bin map[string]string) {
+					bin["bad/id"] = "bin/alpha-service.js"
+				})
+				return pkg.Root
+			},
+			want: "invalid service id",
+		},
+		{
+			name: "missing bin",
+			setup: func(t *testing.T, pkg multiServiceTestPackage) string {
+				updatePackageBin(t, pkg.Root, func(bin map[string]string) {
+					delete(bin, "beta-service")
+				})
+				return pkg.Root
+			},
+			want: "package.json bin",
+		},
+		{
+			name: "missing schema",
+			setup: func(t *testing.T, pkg multiServiceTestPackage) string {
+				if err := os.Remove(filepath.Join(pkg.Root, "vendor__alpha", "config.schema.json")); err != nil {
+					t.Fatal(err)
+				}
+				return pkg.Root
+			},
+			want: "configSchema",
+		},
+		{
+			name: "bad proto",
+			setup: func(t *testing.T, pkg multiServiceTestPackage) string {
+				writeTestFile(t, filepath.Join(pkg.Root, "vendor__alpha", "proto", "service.proto"), "not proto\n", 0o644)
+				return pkg.Root
+			},
+			want: "compile service vendor__alpha descriptor",
+		},
+		{
+			name: "empty scan root",
+			setup: func(t *testing.T, pkg multiServiceTestPackage) string {
+				if err := os.MkdirAll(filepath.Join(pkg.Root, "empty-scan"), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				writeTestFile(t, filepath.Join(pkg.Root, "empty-scan", "README.md"), "empty\n", 0o644)
+				updatePackageFiles(t, pkg.Root, func(files []string) []string {
+					return append(files, "empty-scan")
+				})
+				return pkg.Root + "//empty-scan"
+			},
+			want: "no service roots found",
+		},
+		{
+			name: "missing scan root",
+			setup: func(t *testing.T, pkg multiServiceTestPackage) string {
+				return pkg.Root + "//missing"
+			},
+			want: "scan root",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			dataDir, s := openTestStore(t)
+			pkg := writeMultiServiceTestPackage(t, t.TempDir())
+			source := tc.setup(t, pkg)
+			_, err := (&Importer{DataDir: dataDir, Store: s}).ImportRecursive(context.Background(), Options{Source: source, Recursive: true, Offline: true, Build: "never"})
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("ImportRecursive error=%v want %q", err, tc.want)
+			}
+			services, err := s.ListServices(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(services) != 0 {
+				t.Fatalf("recursive prevalidation failure committed services: %+v", services)
+			}
+		})
+	}
+}
+
+func TestImporterImportRecursiveReimportPreservesExistingName(t *testing.T) {
+	ctx := context.Background()
+	dataDir, s := openTestStore(t)
+	firstPkg := writeMultiServiceTestPackage(t, t.TempDir())
+	secondPkg := writeMultiServiceTestPackage(t, t.TempDir())
+	updateMultiServiceManifestName(t, secondPkg.Root, "vendor__alpha", "alpha-service")
+	updateMultiServiceManifestName(t, secondPkg.Root, "vendor__beta", "beta-service")
+	updateMultiServiceManifestName(t, secondPkg.Root, "nested/vendor__gamma", "gamma-service")
+	imp := &Importer{DataDir: dataDir, Store: s}
+	if _, err := imp.ImportRecursive(ctx, Options{Source: firstPkg.Root, Recursive: true, Offline: true, Build: "never"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.UpdateServiceMetadata(ctx, "alpha-service", "User Renamed Alpha"); err != nil {
+		t.Fatal(err)
+	}
+	res, err := imp.ImportRecursive(ctx, Options{Source: secondPkg.Root, Recursive: true, Offline: true, Build: "never"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, svc := range res.Services {
+		if svc.ID == "alpha-service" && svc.Name != "User Renamed Alpha" {
+			t.Fatalf("recursive reimport did not preserve existing name: %+v", svc)
+		}
+		if svc.ID == "beta-service" && svc.Name != "beta-service display" {
+			t.Fatalf("unexpected beta service name: %+v", svc)
+		}
+	}
+	stored, err := s.GetService(ctx, "alpha-service")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Name != "User Renamed Alpha" {
+		t.Fatalf("stored name=%q want preserved user name", stored.Name)
 	}
 }
 
@@ -235,10 +440,14 @@ func TestSplitSourceServiceRoot(t *testing.T) {
 	}{
 		{source: "./tentacle", wantSource: "./tentacle", wantRoot: "."},
 		{source: "./tentacle//Hanqing_Ticket", wantSource: "./tentacle", wantRoot: "Hanqing_Ticket"},
+		{source: "./tentacle//services/ticket/", wantSource: "./tentacle", wantRoot: "services/ticket"},
+		{source: "./tentacle//services//ticket", wantSource: "./tentacle", wantRoot: "services/ticket"},
 		{source: "npm:@scope/tentacle@1.0.0//services/ticket", wantSource: "npm:@scope/tentacle@1.0.0", wantRoot: "services/ticket"},
+		{source: "npm:./tentacle//nested/vendor__gamma", wantSource: "npm:./tentacle", wantRoot: "nested/vendor__gamma"},
 		{source: "./tentacle.tgz//services/../ticket", wantErrText: "must not contain .."},
 		{source: "./tentacle.tgz///abs", wantErrText: "must be relative"},
 		{source: "./tentacle.tgz//", wantErrText: "must not be empty"},
+		{source: "//svc", wantErrText: "source is required"},
 		{source: "https://github.com/acme/tentacle.git//svc@main", wantSource: "https://github.com/acme/tentacle.git//svc@main", wantRoot: "."},
 		{source: "ssh://github.com/acme/tentacle.git//svc", wantSource: "ssh://github.com/acme/tentacle.git//svc", wantRoot: "."},
 	}
@@ -256,6 +465,74 @@ func TestSplitSourceServiceRoot(t *testing.T) {
 			}
 			if gotSource != tc.wantSource || gotRoot != tc.wantRoot {
 				t.Fatalf("split source=%q root=%q, want source=%q root=%q", gotSource, gotRoot, tc.wantSource, tc.wantRoot)
+			}
+		})
+	}
+}
+
+func TestDiscoverServiceRoots(t *testing.T) {
+	pkg := writeMultiServiceTestPackage(t, t.TempDir())
+	roots, err := discoverServiceRoots(pkg.Root, ".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"nested/vendor__gamma", "vendor__alpha", "vendor__beta"}
+	if strings.Join(roots, ",") != strings.Join(want, ",") {
+		t.Fatalf("discoverServiceRoots(.)=%v want %v", roots, want)
+	}
+	roots, err = discoverServiceRoots(pkg.Root, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(roots, ",") != strings.Join(want, ",") {
+		t.Fatalf("discoverServiceRoots(empty)=%v want %v", roots, want)
+	}
+}
+
+func TestDiscoverServiceRootsScanRoot(t *testing.T) {
+	pkg := writeMultiServiceTestPackage(t, t.TempDir())
+	roots, err := discoverServiceRoots(pkg.Root, "nested")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"nested/vendor__gamma"}
+	if strings.Join(roots, ",") != strings.Join(want, ",") {
+		t.Fatalf("discoverServiceRoots(nested)=%v want %v", roots, want)
+	}
+}
+
+func TestDiscoverServiceRootsStopsAtRootService(t *testing.T) {
+	root := t.TempDir()
+	writeTestPackage(t, root, `{"schema":"chaitin.octobus.service.v1","name":"echo-wrapper","proto":{"roots":["proto"],"files":["proto/echo.proto"]}}`)
+	writeMultiServiceRoot(t, root, multiServiceTestService{ServiceRoot: "nested/vendor__gamma", ID: "gamma-service", NodeEntry: "bin/gamma-service.js", MethodFull: "gamma.v1.GammaService/Call"})
+	roots, err := discoverServiceRoots(root, ".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"."}
+	if strings.Join(roots, ",") != strings.Join(want, ",") {
+		t.Fatalf("discoverServiceRoots(root service)=%v want %v", roots, want)
+	}
+}
+
+func TestDiscoverServiceRootsErrors(t *testing.T) {
+	pkg := writeMultiServiceTestPackage(t, t.TempDir())
+	writeTestFile(t, filepath.Join(pkg.Root, "plain-file"), "fixture", 0o644)
+	tests := []struct {
+		name     string
+		scanRoot string
+		want     string
+	}{
+		{name: "missing", scanRoot: "missing", want: "scan root"},
+		{name: "file", scanRoot: "plain-file", want: "is not a directory"},
+		{name: "empty", scanRoot: "plain-dir", want: "no service roots found"},
+		{name: "invalid", scanRoot: "../outside", want: "must stay inside package"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := discoverServiceRoots(pkg.Root, tc.scanRoot)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("discoverServiceRoots(%q) error=%v want %q", tc.scanRoot, err, tc.want)
 			}
 		})
 	}
@@ -841,6 +1118,39 @@ func TestNPMInstallSelectsCIAndOfflineArgs(t *testing.T) {
 	}
 }
 
+func TestNpmPackOutputAndErrorBranches(t *testing.T) {
+	binDir := t.TempDir()
+	logPath := filepath.Join(t.TempDir(), "npm-mode.log")
+	writeTestFile(t, filepath.Join(binDir, "npm"), `#!/bin/sh
+case "$NPM_FAKE_MODE" in
+empty) exit 0 ;;
+fail) printf 'boom\n' >&2; exit 7 ;;
+*) printf 'notice\npkg-1.0.0.tgz\n' ;;
+esac
+`, 0o755)
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("NPM_FAKE_LOG", logPath)
+
+	t.Setenv("NPM_FAKE_MODE", "ok")
+	packed, err := npmPack(context.Background(), t.TempDir(), filepath.Join(t.TempDir(), "packed"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filepath.Base(packed) != "pkg-1.0.0.tgz" {
+		t.Fatalf("packed path=%q", packed)
+	}
+
+	t.Setenv("NPM_FAKE_MODE", "empty")
+	if _, err := npmPack(context.Background(), t.TempDir(), filepath.Join(t.TempDir(), "packed")); err == nil || !strings.Contains(err.Error(), "did not produce") {
+		t.Fatalf("expected empty npm pack output error, got %v", err)
+	}
+
+	t.Setenv("NPM_FAKE_MODE", "fail")
+	if _, err := runNPMOutput(context.Background(), t.TempDir(), []string{"pack"}); err == nil || !strings.Contains(err.Error(), "boom") {
+		t.Fatalf("expected npm failure output, got %v", err)
+	}
+}
+
 func TestPackageJSONAndPathHelpers(t *testing.T) {
 	dir := t.TempDir()
 	writeTestFile(t, filepath.Join(dir, "package.json"), `{"name":"echo-wrapper","bin":"bin/echo.js","scripts":{"build":"tsc"}}`, 0o644)
@@ -870,13 +1180,35 @@ func TestPackageJSONAndPathHelpers(t *testing.T) {
 	if _, err := parsePackageBin(dir); err == nil || !strings.Contains(err.Error(), "target must be a string") {
 		t.Fatalf("expected non-string bin target error, got %v", err)
 	}
+	writeTestFile(t, filepath.Join(dir, "package.json"), `{"name":"echo-wrapper","bin":{"echo-wrapper":"bin/echo.js"}}`, 0o644)
+	if entry, err := parsePackageBin(dir); err != nil || entry != filepath.Clean("bin/echo.js") {
+		t.Fatalf("expected single map bin target, entry=%q err=%v", entry, err)
+	}
+	writeTestFile(t, filepath.Join(dir, "package.json"), `{"name":"echo-wrapper","bin":{}}`, 0o644)
+	if _, err := parsePackageBinTargets(dir); err == nil || !strings.Contains(err.Error(), "bin is required") {
+		t.Fatalf("expected empty bin target error, got %v", err)
+	}
+	writeTestFile(t, filepath.Join(dir, "package.json"), `{"name":"echo-wrapper","bin":{"echo-wrapper":42}}`, 0o644)
+	if _, err := parsePackageBinTargets(dir); err == nil || !strings.Contains(err.Error(), "target must be a string") {
+		t.Fatalf("expected non-string bin target list error, got %v", err)
+	}
+	writeTestFile(t, filepath.Join(dir, "package.json"), `{"name":"echo-wrapper","bin":"/bin/echo.js"}`, 0o644)
+	if _, err := parsePackageBinTargets(dir); err == nil || !strings.Contains(err.Error(), "relative") {
+		t.Fatalf("expected invalid bin target list error, got %v", err)
+	}
 	writeTestFile(t, filepath.Join(dir, "package.json"), `{`, 0o644)
 	if _, err := parsePackageBin(dir); err == nil {
 		t.Fatal("expected invalid package.json error")
 	}
+	if _, err := parsePackageBinTargets(dir); err == nil {
+		t.Fatal("expected invalid package.json target list error")
+	}
 	missing := filepath.Join(t.TempDir(), "missing")
 	if _, err := readPackageScripts(missing); err == nil {
 		t.Fatal("expected package.json read error")
+	}
+	if _, err := parsePackageBinTargets(missing); err == nil || !strings.Contains(err.Error(), "package.json cannot be read") {
+		t.Fatalf("expected package bin targets read error, got %v", err)
 	}
 	if _, err := inferPackageBin(missing); err == nil || !strings.Contains(err.Error(), "package.json cannot be read") {
 		t.Fatalf("expected infer package bin read error, got %v", err)
@@ -889,6 +1221,76 @@ func TestPackageJSONAndPathHelpers(t *testing.T) {
 	}
 	if err := validatePackageFile(dir, "missing.js", "package.json bin"); err == nil || !strings.Contains(err.Error(), "does not exist") {
 		t.Fatalf("expected missing package file error, got %v", err)
+	}
+}
+
+func TestPackageBinServiceNameBranches(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeTestFile(t, filepath.Join(dir, "bin/echo.js"), "console.log('echo')", 0o644)
+
+	writeTestFile(t, filepath.Join(dir, "package.json"), `{"bin":{"echo":"bin/echo.js","other":"bin/missing.js"}}`, 0o644)
+	entry, err := parsePackageBinForService(dir, "echo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entry != filepath.Clean("bin/echo.js") {
+		t.Fatalf("entry=%q", entry)
+	}
+	if entry, err := inferPackageBinForService(dir, "echo"); err != nil || entry != filepath.Clean("bin/echo.js") {
+		t.Fatalf("infer entry=%q err=%v", entry, err)
+	}
+	if !packageBinTargetsExist(dir, []string{"bin/echo.js"}) {
+		t.Fatal("existing bin target was not detected")
+	}
+	if packageBinTargetsExist(dir, []string{"bin/missing.js"}) {
+		t.Fatal("missing bin target was reported as existing")
+	}
+
+	if _, err := parsePackageBinForService(dir, "missing"); err == nil || !strings.Contains(err.Error(), "missing entry") {
+		t.Fatalf("expected missing service bin error, got %v", err)
+	}
+	writeTestFile(t, filepath.Join(dir, "package.json"), `{"bin":{"echo":42}}`, 0o644)
+	if _, err := parsePackageBinForService(dir, "echo"); err == nil || !strings.Contains(err.Error(), "target must be a string") {
+		t.Fatalf("expected non-string service bin error, got %v", err)
+	}
+	writeTestFile(t, filepath.Join(dir, "package.json"), `{"bin":{"echo":"/abs.js"}}`, 0o644)
+	if _, err := parsePackageBinForService(dir, "echo"); err == nil || !strings.Contains(err.Error(), "relative") {
+		t.Fatalf("expected invalid service bin path error, got %v", err)
+	}
+	writeTestFile(t, filepath.Join(dir, "package.json"), `{"bin":"bin/missing.js"}`, 0o644)
+	if _, err := inferPackageBinForService(dir, ""); err == nil || !strings.Contains(err.Error(), "does not exist") {
+		t.Fatalf("expected missing inferred bin file error, got %v", err)
+	}
+	writeTestFile(t, filepath.Join(dir, "package.json"), `{"bin":"/abs.js"}`, 0o644)
+	if _, err := parsePackageBinForService(dir, ""); err == nil || !strings.Contains(err.Error(), "relative") {
+		t.Fatalf("expected invalid string bin path error, got %v", err)
+	}
+}
+
+func TestManifestAndSourceRootHelpers(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := readManifest(dir); err == nil {
+		t.Fatal("expected missing manifest error")
+	}
+	writeTestFile(t, filepath.Join(dir, "service.json"), `{"schema":42}`, 0o644)
+	if _, err := readManifest(dir); err == nil {
+		t.Fatal("expected manifest type error")
+	}
+
+	if got := recursiveBasePackageSource("not-git//svc", "fallback"); got != "fallback" {
+		t.Fatalf("non-git recursive base=%q", got)
+	}
+	if got := recursiveBasePackageSource("https://%zz", "fallback"); got != "fallback" {
+		t.Fatalf("invalid git recursive base=%q", got)
+	}
+	if got := recursiveBasePackageSource("https://host.example/repo.git//svc", "fallback"); got != "https://host.example/repo.git" {
+		t.Fatalf("git recursive base without ref=%q", got)
+	}
+	if got := sourceWithServiceRootForPackage("https://host.example/repo.git", "svc"); got != "https://host.example/repo.git//svc" {
+		t.Fatalf("git source with root without ref=%q", got)
 	}
 }
 
@@ -986,6 +1388,9 @@ func TestReplaceServiceDirRollbackAndCleanup(t *testing.T) {
 	if err := cleanup(); err != nil {
 		t.Fatal(err)
 	}
+	if _, _, err := replaceServiceDir(filepath.Join(parent, "missing-prepared-target"), filepath.Join(parent, "missing-prepared")); err == nil {
+		t.Fatal("expected missing prepared dir rename error")
+	}
 }
 
 func TestCopyFileAndCopyDirHelpers(t *testing.T) {
@@ -1015,6 +1420,9 @@ func TestCopyFileAndCopyDirHelpers(t *testing.T) {
 	if err := copyFile(src, filepath.Join(dir, "nested"), 0o600); err == nil {
 		t.Fatal("expected destination directory error")
 	}
+	if err := copyFile(treeReadErrorSource(t, dir), filepath.Join(dir, "read-error.txt"), 0o600); err == nil {
+		t.Fatal("expected source read error")
+	}
 
 	tree := filepath.Join(dir, "tree")
 	if err := os.MkdirAll(filepath.Join(tree, "sub"), 0o755); err != nil {
@@ -1037,6 +1445,15 @@ func TestCopyFileAndCopyDirHelpers(t *testing.T) {
 	if err := copyDir(filepath.Join(dir, "missing-tree"), filepath.Join(dir, "missing-copy")); err == nil {
 		t.Fatal("expected missing tree copy error")
 	}
+}
+
+func treeReadErrorSource(t *testing.T, dir string) string {
+	t.Helper()
+	sourceDir := filepath.Join(dir, "source-dir")
+	if err := os.MkdirAll(sourceDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return sourceDir
 }
 
 func TestTarGzUntarAndUnzipHelpers(t *testing.T) {
@@ -1124,6 +1541,30 @@ func TestTarGzUntarAndUnzipHelpers(t *testing.T) {
 	writeZipArchive(t, unsafeZip, "../escape.txt", "bad")
 	if err := unzip(unsafeZip, filepath.Join(dir, "unsafe-zip-out")); err == nil || !strings.Contains(err.Error(), "unsafe archive path") {
 		t.Fatalf("expected unsafe zip path error, got %v", err)
+	}
+	if err := tarGzDir(filepath.Join(dir, "missing-src"), filepath.Join(dir, "missing-src.tgz")); err == nil {
+		t.Fatal("expected missing source tar error")
+	}
+	if err := untarGz(filepath.Join(dir, "missing.tgz"), filepath.Join(dir, "missing-out")); err == nil {
+		t.Fatal("expected missing tgz error")
+	}
+	invalidTar := filepath.Join(dir, "invalid-tar.tgz")
+	var invalid bytes.Buffer
+	invalidGz := gzip.NewWriter(&invalid)
+	if _, err := invalidGz.Write([]byte("not tar")); err != nil {
+		t.Fatal(err)
+	}
+	if err := invalidGz.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(invalidTar, invalid.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := untarGz(invalidTar, filepath.Join(dir, "invalid-tar-out")); err == nil {
+		t.Fatal("expected invalid tar error")
+	}
+	if err := unzip(filepath.Join(dir, "missing.zip"), filepath.Join(dir, "missing-zip-out")); err == nil {
+		t.Fatal("expected missing zip error")
 	}
 }
 
@@ -1263,6 +1704,179 @@ message EchoRequest { string text = 1; }
 message EchoResponse { string text = 1; }
 `, 0o644)
 	return pkg
+}
+
+type multiServiceTestPackage struct {
+	Root     string
+	Services []multiServiceTestService
+}
+
+type multiServiceTestService struct {
+	ServiceRoot string
+	ID          string
+	NodeEntry   string
+	MethodFull  string
+}
+
+func writeMultiServiceTestPackage(t *testing.T, root string) multiServiceTestPackage {
+	t.Helper()
+	services := []multiServiceTestService{
+		{ServiceRoot: "vendor__alpha", ID: "alpha-service", NodeEntry: "bin/alpha-service.js", MethodFull: "alpha.v1.AlphaService/Call"},
+		{ServiceRoot: "vendor__beta", ID: "beta-service", NodeEntry: "bin/beta-service.js", MethodFull: "beta.v1.BetaService/Call"},
+		{ServiceRoot: "nested/vendor__gamma", ID: "gamma-service", NodeEntry: "bin/gamma-service.js", MethodFull: "gamma.v1.GammaService/Call"},
+	}
+	if err := os.MkdirAll(filepath.Join(root, "bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "node_modules"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	bin := map[string]string{}
+	files := []string{"bin", "vendor__alpha", "vendor__beta", "nested"}
+	for _, service := range services {
+		bin[service.ID] = service.NodeEntry
+		writeTestFile(t, filepath.Join(root, filepath.FromSlash(service.NodeEntry)), "#!/bin/sh\n", 0o755)
+		writeMultiServiceRoot(t, root, service)
+	}
+	pkg := map[string]any{
+		"name":    "multi-service-fixture",
+		"version": "1.0.0",
+		"bin":     bin,
+		"files":   files,
+	}
+	raw, err := json.Marshal(pkg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeTestFile(t, filepath.Join(root, "package.json"), string(raw), 0o644)
+	writeIgnoredServiceJSON(t, filepath.Join(root, "node_modules", "ignored"))
+	writeIgnoredServiceJSON(t, filepath.Join(root, ".git", "ignored"))
+	writeIgnoredServiceJSON(t, filepath.Join(root, ".hidden", "ignored"))
+	if err := os.MkdirAll(filepath.Join(root, "plain-dir"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return multiServiceTestPackage{Root: root, Services: services}
+}
+
+func writeMultiServiceRoot(t *testing.T, root string, service multiServiceTestService) {
+	t.Helper()
+	serviceDir := filepath.Join(root, filepath.FromSlash(service.ServiceRoot))
+	if err := os.MkdirAll(serviceDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(serviceDir, "proto"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	methodService, _, ok := strings.Cut(service.MethodFull, "/")
+	if !ok {
+		t.Fatalf("invalid method full name %q", service.MethodFull)
+	}
+	lastDot := strings.LastIndex(methodService, ".")
+	if lastDot < 0 {
+		t.Fatalf("invalid method full name %q", service.MethodFull)
+	}
+	protoPackage := methodService[:lastDot]
+	serviceName := methodService[lastDot+1:]
+	manifest := map[string]any{
+		"schema":       "chaitin.octobus.service.v1",
+		"name":         service.ID,
+		"displayName":  service.ID + " display",
+		"configSchema": "config.schema.json",
+		"secretSchema": "secret.schema.json",
+		"proto": map[string]any{
+			"roots": []string{"proto"},
+			"files": []string{"proto/service.proto"},
+		},
+	}
+	raw, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeTestFile(t, filepath.Join(serviceDir, "service.json"), string(raw), 0o644)
+	writeTestFile(t, filepath.Join(serviceDir, "config.schema.json"), `{"type":"object"}`, 0o644)
+	writeTestFile(t, filepath.Join(serviceDir, "secret.schema.json"), `{"type":"object"}`, 0o644)
+	writeTestFile(t, filepath.Join(serviceDir, "proto/service.proto"), `syntax = "proto3";
+package `+protoPackage+`;
+service `+serviceName+` { rpc Call(CallRequest) returns (CallResponse); }
+message CallRequest { string text = 1; }
+message CallResponse { string text = 1; }
+`, 0o644)
+}
+
+func writeIgnoredServiceJSON(t *testing.T, dir string) {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeTestFile(t, filepath.Join(dir, "service.json"), `{"schema":"chaitin.octobus.service.v1","name":"ignored","proto":{"roots":["proto"],"files":["proto/ignored.proto"]}}`, 0o644)
+}
+
+func updateMultiServiceManifestName(t *testing.T, root, serviceRoot, name string) {
+	t.Helper()
+	path := filepath.Join(root, filepath.FromSlash(serviceRoot), "service.json")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var manifest map[string]any
+	if err := json.Unmarshal(raw, &manifest); err != nil {
+		t.Fatal(err)
+	}
+	manifest["name"] = name
+	manifest["displayName"] = name + " display"
+	updated, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeTestFile(t, path, string(updated), 0o644)
+}
+
+func updatePackageBin(t *testing.T, root string, mutate func(map[string]string)) {
+	t.Helper()
+	path := filepath.Join(root, "package.json")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var pkg struct {
+		Name    string            `json:"name"`
+		Version string            `json:"version"`
+		Bin     map[string]string `json:"bin"`
+		Files   []string          `json:"files"`
+	}
+	if err := json.Unmarshal(raw, &pkg); err != nil {
+		t.Fatal(err)
+	}
+	mutate(pkg.Bin)
+	updated, err := json.Marshal(pkg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeTestFile(t, path, string(updated), 0o644)
+}
+
+func updatePackageFiles(t *testing.T, root string, mutate func([]string) []string) {
+	t.Helper()
+	path := filepath.Join(root, "package.json")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var pkg struct {
+		Name    string            `json:"name"`
+		Version string            `json:"version"`
+		Bin     map[string]string `json:"bin"`
+		Files   []string          `json:"files"`
+	}
+	if err := json.Unmarshal(raw, &pkg); err != nil {
+		t.Fatal(err)
+	}
+	pkg.Files = mutate(pkg.Files)
+	updated, err := json.Marshal(pkg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeTestFile(t, path, string(updated), 0o644)
 }
 
 func testManifestName(t *testing.T, manifest string) string {

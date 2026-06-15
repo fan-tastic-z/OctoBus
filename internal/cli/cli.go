@@ -217,11 +217,23 @@ func (c *CLI) serviceCommand() *cobra.Command {
 
 func (c *CLI) serviceImportCommand() *cobra.Command {
 	var name, build string
-	var offline, reinstall bool
+	var offline, reinstall, recursive bool
 	cmd := &cobra.Command{
-		Use:   "import SERVICE SOURCE [--name NAME] [--build auto|always|never] [--offline] [--reinstall]",
+		Use:   "import SERVICE SOURCE [--name NAME] [--build auto|always|never] [--offline] [--reinstall]\n  octobus service import --recursive SOURCE [--build auto|always|never] [--offline] [--reinstall]",
 		Short: "Import or update a service package",
 		Args: func(cmd *cobra.Command, args []string) error {
+			if recursive {
+				if name != "" {
+					return errors.New("--name cannot be used with --recursive")
+				}
+				if len(args) < 1 {
+					return errors.New("service source is required")
+				}
+				if len(args) > 1 {
+					return fmt.Errorf("accepts 1 arg(s), received %d", len(args))
+				}
+				return nil
+			}
 			if len(args) < 1 {
 				return errors.New("service id is required")
 			}
@@ -234,9 +246,18 @@ func (c *CLI) serviceImportCommand() *cobra.Command {
 			return nil
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
-			source, err := normalizeImportSource(args[1])
+			var sourceArg string
+			if recursive {
+				sourceArg = args[0]
+			} else {
+				sourceArg = args[1]
+			}
+			source, err := normalizeImportSource(sourceArg)
 			if err != nil {
 				return err
+			}
+			if recursive {
+				return c.request(http.MethodPost, "/admin/v1/services/import", map[string]any{"recursive": true, "source": source, "offline": offline, "reinstall": reinstall, "build": build})
 			}
 			return c.request(http.MethodPost, "/admin/v1/services/import", map[string]any{"service_id": args[0], "name": name, "source": source, "offline": offline, "reinstall": reinstall, "build": build})
 		},
@@ -245,6 +266,7 @@ func (c *CLI) serviceImportCommand() *cobra.Command {
 	cmd.Flags().StringVar(&build, "build", "auto", "source package build policy: auto, always, or never")
 	cmd.Flags().BoolVar(&offline, "offline", false, "use npm offline cache")
 	cmd.Flags().BoolVar(&reinstall, "reinstall", false, "reinstall dependencies")
+	cmd.Flags().BoolVar(&recursive, "recursive", false, "import all services discovered under the package source")
 	return cmd
 }
 
@@ -279,7 +301,7 @@ func (c *CLI) serviceUpdateCommand() *cobra.Command {
 func normalizeImportSource(source string) (string, error) {
 	if strings.HasPrefix(source, "npm:") {
 		spec := strings.TrimPrefix(source, "npm:")
-		normalized, err := normalizeLocalImportSource(spec)
+		normalized, err := normalizeLocalImportPackageSource(spec)
 		if err != nil {
 			return "", err
 		}
@@ -288,7 +310,22 @@ func normalizeImportSource(source string) (string, error) {
 		}
 		return "npm:" + normalized, nil
 	}
-	return normalizeLocalImportSource(source)
+	return normalizeLocalImportPackageSource(source)
+}
+
+func normalizeLocalImportPackageSource(source string) (string, error) {
+	if source == "" || strings.Contains(source, "://") {
+		return source, nil
+	}
+	packageSource, serviceRoot, ok := strings.Cut(source, "//")
+	normalized, err := normalizeLocalImportSource(packageSource)
+	if err != nil {
+		return "", err
+	}
+	if !ok {
+		return normalized, nil
+	}
+	return normalized + "//" + serviceRoot, nil
 }
 
 func normalizeLocalImportSource(source string) (string, error) {

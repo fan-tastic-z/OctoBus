@@ -27,11 +27,16 @@ import (
 
 type Server struct {
 	Store         *store.Store
-	Importer      *packageimport.Importer
+	Importer      serviceImporter
 	Supervisor    *supervisor.Supervisor
 	Gateway       *protocol.Gateway
 	AccessLogPath string
 	Logger        *slog.Logger
+}
+
+type serviceImporter interface {
+	Import(context.Context, packageimport.Options) (packageimport.Result, error)
+	ImportRecursive(context.Context, packageimport.Options) (packageimport.RecursiveResult, error)
 }
 
 type instanceResponse struct {
@@ -401,6 +406,10 @@ func (s *Server) handleServiceImport(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	if req.Recursive {
+		s.handleRecursiveServiceImport(w, r, req)
+		return
+	}
 	s.logger().Info("service_import_started", "service_id", req.ServiceID, "offline", req.Offline, "reinstall", req.Reinstall, "build", req.Build)
 	res, err := s.Importer.Import(r.Context(), req)
 	if err != nil {
@@ -415,6 +424,57 @@ func (s *Server) handleServiceImport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"service": res.Service, "restarted_instances": restarted, "restart_errors": restartErrs})
+}
+
+func (s *Server) handleRecursiveServiceImport(w http.ResponseWriter, r *http.Request, req packageimport.Options) {
+	if req.Source == "" {
+		writeError(w, http.StatusBadRequest, "service package source is required")
+		return
+	}
+	if req.ServiceID != "" {
+		writeError(w, http.StatusBadRequest, "service_id cannot be used with recursive import")
+		return
+	}
+	if req.Name != "" {
+		writeError(w, http.StatusBadRequest, "name cannot be used with recursive import")
+		return
+	}
+	s.logger().Info("service_import_recursive_started", "offline", req.Offline, "reinstall", req.Reinstall, "build", req.Build)
+	res, err := s.Importer.ImportRecursive(r.Context(), req)
+	if err != nil {
+		s.logger().Warn("service_import_recursive_failed", "error", err)
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	s.logger().Info("service_import_recursive_done", "service_count", len(res.Services))
+	restartedByService := make(map[string][]string, len(res.Services))
+	restartErrsByService := make(map[string][]string, len(res.Services))
+	degraded := false
+	for _, svc := range res.Services {
+		restarted, restartErrs := s.restartEnabledServiceInstances(r.Context(), svc.ID)
+		if restarted == nil {
+			restarted = []string{}
+		}
+		if restartErrs == nil {
+			restartErrs = []string{}
+		}
+		restartedByService[svc.ID] = restarted
+		restartErrsByService[svc.ID] = restartErrs
+		if len(restartErrs) > 0 {
+			degraded = true
+		}
+	}
+	serviceCount := res.ServiceCount
+	if serviceCount == 0 {
+		serviceCount = len(res.Services)
+	}
+	body := map[string]any{"services": res.Services, "service_count": serviceCount, "restarted_instances": restartedByService, "restart_errors": restartErrsByService}
+	if degraded {
+		body["status"] = "degraded"
+		writeJSON(w, http.StatusConflict, body)
+		return
+	}
+	writeJSON(w, http.StatusOK, body)
 }
 
 func (s *Server) echoServiceImport(c *echo.Context) error {

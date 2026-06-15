@@ -120,6 +120,16 @@ OctoBus 对 package artifact 计算 sha256，并把 hash 写入 SQLite。
 
 `service.json` 是 import 阶段的 manifest。每个 service root 必须提供 `service.json`。单个 distribution package 可以包含多个 service root；导入时由 source 的 `//service-dir` 选择其中一个。
 
+也可以使用 recursive import 一次导入 distribution package 中发现到的多个 service root：
+
+```text
+octobus service import --recursive npm:@chaitin-ai/octobus-tentacles
+octobus service import --recursive ./platform-services//subset
+```
+
+recursive 模式不接受用户指定 service id，导入的 service id 来自各自 `service.json.name`；
+`source//some-dir` 表示递归发现的 scan root，不裁剪 artifact，也不改变依赖安装根目录。
+
 示例：
 
 ```json
@@ -150,7 +160,7 @@ OctoBus 对 package artifact 计算 sha256，并把 hash 写入 SQLite。
 字段说明：
 
 - `schema` 必须等于 `chaitin.octobus.service.v1`。
-- `name` 是 package 内声明的 service package 名称，不要求等于 npm package name，也不作为 OctoBus service id。多 `bin` package 中，`name` 必须匹配根 `package.json bin` object 的 key。
+- `name` 是 package 内声明的 service package 名称，不要求等于 npm package name。单 service import 时，OctoBus service id 仍由 `octobus service import SERVICE SOURCE` 的 `SERVICE` 位置参数指定；recursive import 时，导入的 service id 来自各自 `service.json.name`。多 `bin` package 中，`name` 必须匹配根 `package.json bin` object 的 key。
 - `displayName` 和 `description` 是可选展示信息。
 - `runtime.mode` 可选，支持 `long-running` 和 `on-demand`，缺省等价于 `long-running`。
 - `proto.roots` 是 proto import root 列表。
