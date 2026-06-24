@@ -1,8 +1,8 @@
 {
   "schema": "chaitin.octobus.service.v1",
-  "name": "topsec-waf",
-  "displayName": "TopSec WAF",
-  "description": "OctoBus package for TopSec WAF IP blacklist management and URL block rules via RESTful API.",
+  "name": "topsec-waf-v3-2294-20238",
+  "displayName": "TopSec WAF v3.2294.20238",
+  "description": "OctoBus package for TopSec WAF v3.2294.20238 — IP blacklist management and URL block rules via RESTful API.",
   "runtime": {
     "mode": "long-running"
   },

@@ -52,7 +52,7 @@ function mockWafRows(rows = [], total = 0) {
 // ── helper tests ──────────────────────────────────────────────────
 
 test('internal helpers', async (t) => {
-  const { _test } = await import('../src/topsec-waf.js');
+  const { _test } = await import('../src/topsec-waf-v3-2294-20238.js');
 
   await t.test('grpcCodeFor maps known codes', () => {
     assert.equal(_test.grpcCodeFor('INVALID_ARGUMENT'), 3);
@@ -118,7 +118,7 @@ test('AddBlacklistIP', async (t) => {
       return new Response('{}', { status: 200 });
     });
 
-    const { rpcdef } = await import('../src/topsec-waf.js');
+    const { rpcdef } = await import('../src/topsec-waf-v3-2294-20238.js');
     const handler = rpcdef(buildCtx({ name: 'blacklist', ip_addresses: ['19.1.1.1'] }))[addPath];
     const result = await handler();
 
@@ -128,13 +128,13 @@ test('AddBlacklistIP', async (t) => {
   });
 
   await t.test('rejects missing name', async () => {
-    const { rpcdef } = await import('../src/topsec-waf.js');
+    const { rpcdef } = await import('../src/topsec-waf-v3-2294-20238.js');
     const handler = rpcdef(buildCtx({ ip_addresses: ['1.2.3.4'] }))[addPath];
     await assert.rejects(handler, /name required/);
   });
 
   await t.test('rejects empty ip_addresses', async () => {
-    const { rpcdef } = await import('../src/topsec-waf.js');
+    const { rpcdef } = await import('../src/topsec-waf-v3-2294-20238.js');
     const handler = rpcdef(buildCtx({ name: 'test', ip_addresses: [] }))[addPath];
     await assert.rejects(handler, /ip_addresses required/);
   });
@@ -149,7 +149,7 @@ test('DeleteBlacklistIP', async (t) => {
       return new Response('{}', { status: 200 });
     });
 
-    const { rpcdef } = await import('../src/topsec-waf.js');
+    const { rpcdef } = await import('../src/topsec-waf-v3-2294-20238.js');
     const handler = rpcdef(buildCtx({ name: 'blacklist' }))[deletePath];
     const result = await handler();
 
@@ -157,7 +157,7 @@ test('DeleteBlacklistIP', async (t) => {
   });
 
   await t.test('rejects missing name', async () => {
-    const { rpcdef } = await import('../src/topsec-waf.js');
+    const { rpcdef } = await import('../src/topsec-waf-v3-2294-20238.js');
     const handler = rpcdef(buildCtx({}))[deletePath];
     await assert.rejects(handler, /name required/);
   });
@@ -176,7 +176,7 @@ test('ListBlacklistIPs', async (t) => {
       return new Response('{}', { status: 200 });
     });
 
-    const { rpcdef } = await import('../src/topsec-waf.js');
+    const { rpcdef } = await import('../src/topsec-waf-v3-2294-20238.js');
     const handler = rpcdef(buildCtx({}))[listPath];
     const result = await handler();
 
@@ -197,7 +197,7 @@ test('AddUrlBlock', async (t) => {
       return new Response('{}', { status: 200 });
     });
 
-    const { rpcdef } = await import('../src/topsec-waf.js');
+    const { rpcdef } = await import('../src/topsec-waf-v3-2294-20238.js');
     const handler = rpcdef(buildCtx({
       security_policy: 'test-acl-policy',
       name: 'block-admin',
@@ -210,13 +210,13 @@ test('AddUrlBlock', async (t) => {
   });
 
   await t.test('rejects missing security_policy', async () => {
-    const { rpcdef } = await import('../src/topsec-waf.js');
+    const { rpcdef } = await import('../src/topsec-waf-v3-2294-20238.js');
     const handler = rpcdef(buildCtx({ name: 'x', url: '/path' }))[urlAddPath];
     await assert.rejects(handler, /security_policy required/);
   });
 
   await t.test('rejects missing url', async () => {
-    const { rpcdef } = await import('../src/topsec-waf.js');
+    const { rpcdef } = await import('../src/topsec-waf-v3-2294-20238.js');
     const handler = rpcdef(buildCtx({ security_policy: 'p', name: 'x' }))[urlAddPath];
     await assert.rejects(handler, /url required/);
   });
@@ -229,7 +229,7 @@ test('AddUrlBlock', async (t) => {
       return new Response('{}', { status: 200 });
     });
 
-    const { rpcdef } = await import('../src/topsec-waf.js');
+    const { rpcdef } = await import('../src/topsec-waf-v3-2294-20238.js');
     const handler = rpcdef(buildCtx({
       security_policy: 'test-policy',
       name: 'block-x',
@@ -250,7 +250,7 @@ test('DeleteUrlBlock', async (t) => {
       return new Response('{}', { status: 200 });
     });
 
-    const { rpcdef } = await import('../src/topsec-waf.js');
+    const { rpcdef } = await import('../src/topsec-waf-v3-2294-20238.js');
     const handler = rpcdef(buildCtx({
       security_policy: 'test-acl-policy',
       name: 'block-login',
@@ -274,7 +274,7 @@ test('ListUrlBlocks', async (t) => {
       return new Response('{}', { status: 200 });
     });
 
-    const { rpcdef } = await import('../src/topsec-waf.js');
+    const { rpcdef } = await import('../src/topsec-waf-v3-2294-20238.js');
     const handler = rpcdef(buildCtx({
       security_policy: 'test-acl-policy',
     }))[urlListPath];
@@ -296,7 +296,7 @@ test('SetUrlBlockStatus', async (t) => {
       return new Response('{}', { status: 200 });
     });
 
-    const { rpcdef } = await import('../src/topsec-waf.js');
+    const { rpcdef } = await import('../src/topsec-waf-v3-2294-20238.js');
     const handler = rpcdef(buildCtx({
       security_policy: 'test-acl-policy',
       name: 'block-admin',
@@ -308,7 +308,7 @@ test('SetUrlBlockStatus', async (t) => {
   });
 
   await t.test('rejects missing security_policy', async () => {
-    const { rpcdef } = await import('../src/topsec-waf.js');
+    const { rpcdef } = await import('../src/topsec-waf-v3-2294-20238.js');
     const handler = rpcdef(buildCtx({ name: 'x' }))[urlStatusPath];
     await assert.rejects(handler, /security_policy required/);
   });
@@ -329,7 +329,7 @@ test('error: WAF auth expired returns PERMISSION_DENIED', async () => {
     return new Response('{}', { status: 200 });
   });
 
-  const { rpcdef } = await import('../src/topsec-waf.js');
+  const { rpcdef } = await import('../src/topsec-waf-v3-2294-20238.js');
   const handler = rpcdef(buildCtx({}))[listPath];
   await assert.rejects(handler, /PERMISSION_DENIED/);
 });
@@ -344,7 +344,7 @@ test('error: WAF 500 returns UNAVAILABLE', async () => {
     return new Response('{}', { status: 200 });
   });
 
-  const { rpcdef } = await import('../src/topsec-waf.js');
+  const { rpcdef } = await import('../src/topsec-waf-v3-2294-20238.js');
   const handler = rpcdef(buildCtx({}))[listPath];
   await assert.rejects(handler, /UNAVAILABLE/);
 });
@@ -362,7 +362,7 @@ test('error: non-JSON WAF response returns UNKNOWN', async () => {
     return new Response('{}', { status: 200 });
   });
 
-  const { rpcdef } = await import('../src/topsec-waf.js');
+  const { rpcdef } = await import('../src/topsec-waf-v3-2294-20238.js');
   const handler = rpcdef(buildCtx({}))[listPath];
   await assert.rejects(handler, /UNKNOWN/);
 });
@@ -380,13 +380,13 @@ test('error: WAF command failed returns FAILED_PRECONDITION', async () => {
     return new Response('{}', { status: 200 });
   });
 
-  const { rpcdef } = await import('../src/topsec-waf.js');
+  const { rpcdef } = await import('../src/topsec-waf-v3-2294-20238.js');
   const handler = rpcdef(buildCtx({ name: 'nonexistent' }))[deletePath];
   await assert.rejects(handler, /FAILED_PRECONDITION/);
 });
 
 test('error: login 401 returns PERMISSION_DENIED', async () => {
-  const { _test } = await import('../src/topsec-waf.js');
+  const { _test } = await import('../src/topsec-waf-v3-2294-20238.js');
   _test.resetSession(); // ensure fresh session
 
   mockFetch(async (url) => {
@@ -397,7 +397,7 @@ test('error: login 401 returns PERMISSION_DENIED', async () => {
     return new Response('{}', { status: 200 });
   });
 
-  const { rpcdef } = await import('../src/topsec-waf.js');
+  const { rpcdef } = await import('../src/topsec-waf-v3-2294-20238.js');
   // use different credentials to avoid session cache from prior tests
   const ctx = {
     config: { host: 'http://localhost:28080' },
@@ -412,7 +412,7 @@ test('error: login 401 returns PERMISSION_DENIED', async () => {
 // ── config/secret tests ───────────────────────────────────────────
 
 test('config: invalid host rejects early', async () => {
-  const { rpcdef } = await import('../src/topsec-waf.js');
+  const { rpcdef } = await import('../src/topsec-waf-v3-2294-20238.js');
   const ctx = {
     config: { host: 'not-a-url' },
     secret: { username: 'u', password: 'p' },
@@ -423,7 +423,7 @@ test('config: invalid host rejects early', async () => {
 });
 
 test('config: missing password rejects early', async () => {
-  const { rpcdef } = await import('../src/topsec-waf.js');
+  const { rpcdef } = await import('../src/topsec-waf-v3-2294-20238.js');
   const ctx = {
     config: { host: 'http://x' },
     secret: { username: 'u' },

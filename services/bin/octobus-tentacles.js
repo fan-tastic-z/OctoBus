@@ -133,9 +133,9 @@ const services = {
     entryFile: "../threatbook__tip_v4/bin/threatbook-tip-v4.js",
     serviceModule: "../threatbook__tip_v4/src/service.js",
   },
-  "topsec-waf": {
-    entryFile: "../topsec__waf/bin/topsec-waf.js",
-    serviceModule: "../topsec__waf/src/service.js",
+  "topsec-waf-v3-2294-20238": {
+    entryFile: "../topsec__waf_v3-2294-20238/bin/topsec-waf-v3-2294-20238.js",
+    serviceModule: "../topsec__waf_v3-2294-20238/src/service.js",
   },
   "topsec-fw-2u": {
     entryFile: "../topsec__fw-2u/bin/topsec-fw-2u.js",
