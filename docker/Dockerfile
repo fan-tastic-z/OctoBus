@@ -32,12 +32,12 @@ ARG OCTOBUS_COMMIT
 ARG OCTOBUS_BUILD_DATE
 RUN bash ./scripts/build-octobus.sh /out/octobus \
     && if LC_ALL=C ldd /out/octobus 2>&1 | grep -q "not a dynamic executable"; then \
-    true; \
-    else \
-    echo "/out/octobus is dynamically linked; expected a static binary" >&2; \
-    LC_ALL=C ldd /out/octobus >&2; \
-    exit 1; \
-    fi
+		true; \
+	else \
+		echo "/out/octobus is dynamically linked; expected a static binary" >&2; \
+		LC_ALL=C ldd /out/octobus >&2; \
+		exit 1; \
+	fi
 
 FROM ${REGISTRY_MIRROR}/library/ubuntu:26.04
 
@@ -47,16 +47,16 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-    ca-certificates \
-    curl \
-    git \
-    nodejs \
-    npm \
-    protobuf-compiler \
-    libprotobuf-dev \
-    && rm -rf /var/lib/apt/lists/* \
-    && groupadd --system octobus \
-    && useradd --system --gid octobus --home-dir /var/lib/octobus --create-home --shell /usr/sbin/nologin octobus
+		ca-certificates \
+		curl \
+		git \
+		nodejs \
+		npm \
+		protobuf-compiler \
+		libprotobuf-dev \
+	&& rm -rf /var/lib/apt/lists/* \
+	&& groupadd --system octobus \
+	&& useradd --system --gid octobus --home-dir /var/lib/octobus --create-home --shell /usr/sbin/nologin octobus
 
 COPY --from=builder /out/octobus /usr/local/bin/octobus
 
