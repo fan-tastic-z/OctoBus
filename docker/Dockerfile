@@ -13,13 +13,13 @@ WORKDIR /src
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-    ca-certificates \
-    git \
-    make \
-    nodejs \
-    npm \
-    protobuf-compiler \
-    libprotobuf-dev \
+        ca-certificates \
+        git \
+        make \
+        nodejs \
+        npm \
+        protobuf-compiler \
+        libprotobuf-dev \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=golang-toolchain /usr/local/go /usr/local/go
